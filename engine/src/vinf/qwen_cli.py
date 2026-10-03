@@ -34,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-order", choices=("grouped", "tiled"), default="tiled",
                         help="SSM value-head order; llama.cpp GGUF conversions are tiled")
     parser.add_argument("--safety-mib", type=int, default=256, help="VRAM left unallocated (raise if loading runs out of memory)")
-    parser.add_argument("--prefill-batch", type=int, default=64,
+    parser.add_argument("--prefill-batch", type=int, default=256,
                         help="prompt tokens per pass; each streamed weight crosses PCIe once per pass")
     parser.add_argument("--prefix-cache-mib", type=int, default=8192,
                         help="host memory for prompt prefix checkpoints (0 disables); reuses earlier turns of a conversation")

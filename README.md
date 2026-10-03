@@ -163,7 +163,9 @@ The `/v1` prefix is optional (`/chat/completions` works too), so clients can use
 
 Agentic clients (OpenCode and similar) send long system prompts with many tool definitions; start the server with a
 larger context, e.g. `--max-context 32768`. `max_tokens` larger than the room left in the context is clipped.
-Prompt processing currently runs at about 25 tokens/s, so a first request with a 10k-token prompt takes minutes.
+Prompt processing runs on tensor cores in 256-token passes (~230 tokens/s cold on Q3_K_XL at 32k context), and a
+prefix cache (`--prefix-cache-mib`, default 8192) resumes later turns of a conversation from the previous prompt,
+so follow-up requests only process the new tokens (a 10k-token turn: ~1.5 s instead of minutes).
 
 Thinking is on by default as in Qwen (the reasoning is returned in `reasoning_content`); turn it off per
 request with `"reasoning_effort": "none"` or `"chat_template_kwargs": {"enable_thinking": false}`, or for
@@ -218,7 +220,7 @@ Working: single-sequence greedy decoding of Qwen3.8-27B GGUF models on the RTX 3
 served from the CLI or an OpenAI-compatible HTTP API.
 Next:
 
-- Faster prompt processing for agentic clients: prefix cache across requests and wider prefill passes
+- fp16 KV cache (more weights resident at long contexts)
 - Concurrent multi-agent decoding (many sequences per pass for higher total throughput)
 - Temperature / top-k / top-p sampling with lossless speculative sampling
 - Smaller DFlash 2 draft footprint (4-bit draft weights, cheaper SSM snapshots)

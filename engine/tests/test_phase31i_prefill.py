@@ -80,6 +80,34 @@ class TiledAttentionTests(unittest.TestCase):
         self.check(ntok=24, seq_len0=30, window=19)
 
 
+class TensorCoreGemmTests(unittest.TestCase):
+    def test_gemm_matches_matvec_for_every_type(self):
+        from tests.test_phase30_cuda_qmatvec import synthetic_rows
+        from vinf.cuda.qwen_runtime import CUDA_MATVEC_TYPES
+
+        rt = runtime_or_skip(self)
+        rng = random.Random(41)
+        rows, cols, ntok = 70, 512, 37  # partial row and token tiles
+        x = [rng.uniform(-1, 1) for _ in range(ntok * cols)]
+        rt.alloc("x", ntok * cols)
+        rt.write("x", array("f", x).tobytes())
+        rt.alloc("y_ref", ntok * rows)
+        rt.alloc("y_gemm", ntok * rows)
+        for tensor_type in sorted(CUDA_MATVEC_TYPES):
+            raw = synthetic_rows(tensor_type, rows, cols, rng)
+            rt.upload_raw("w", raw, tensor_type, cols, rows)
+            rt.set_gemm_min_rows(1000)  # fp32 matvec groups
+            rt.qmv("w", "x", "y_ref", ntok)
+            rt.set_gemm_min_rows(1)
+            rt.qmv("w", "x", "y_gemm", ntok)
+            rt.set_gemm_min_rows(0)
+            ref, got = rt.read_floats("y_ref"), rt.read_floats("y_gemm")
+            scale = max(abs(v) for v in ref)
+            for idx, (a, b) in enumerate(zip(got, ref)):
+                self.assertLessEqual(abs(a - b), 3e-3 * scale, (tensor_type.name, idx, a, b))
+            rt.free("w")
+
+
 class WidePrefillTests(unittest.TestCase):
     def setUp(self):
         self.meta = dataclasses.replace(gpu_metadata(), max_position_embeddings=512)

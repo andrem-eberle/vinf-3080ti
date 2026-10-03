@@ -14,6 +14,7 @@
 #include <Python.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include <cmath>
 #include <cstdint>
@@ -395,6 +396,128 @@ cudaError_t launch_qmatvec_typed(const uint8_t *w, const float *x, float *y, int
     return cudaGetLastError();
 }
 
+// ---- prompt-pass GEMM on tensor cores ------------------------------------------------------------
+// Y[t][r] = sum_k W[r][k] X[t][k] for many token rows t. A block owns kGemmBM weight rows x kGemmBN
+// tokens: it dequantizes a kGemmBM x kGemmBK weight tile to fp16 in shared memory (each weight read
+// once per token tile), takes the fp16 activations straight from global/L2 as the column-major B
+// operand, and accumulates 16x16x16 fp16 MMAs in fp32. Every output element is a dot product in the
+// same K order whatever the batch size or tiling, so results do not depend on how a prompt is split.
+constexpr int kGemmBM = 64, kGemmBN = 64, kGemmBK = 32, kGemmLdA = kGemmBK + 8, kGemmWarps = 4;
+
+__global__ void f32_to_f16_rows_kernel(const float *x, __half *xh, int ntok, int ntok_pad, int cols) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<size_t>(ntok_pad) * cols) return;
+    xh[i] = i < static_cast<size_t>(ntok) * cols ? __float2half_rn(x[i]) : __float2half_rn(0.0f);
+}
+
+template <int TYPE>
+__global__ void __launch_bounds__(32 * kGemmWarps) vinf_qgemm_kernel(const uint8_t *w, const __half *xh, float *y,
+                                                                       int rows, int cols, int row_bytes, int ntok,
+                                                                       int block_size, int type_size) {
+    using namespace nvcuda;
+    __shared__ int8_t s_iq4nl[16];
+    __shared__ uint8_t s_iq3s_grid[kGridBytes<TYPE> > 0 ? kGridBytes<TYPE> : 4];
+    __shared__ __align__(32) __half a_tile[kGemmBM * kGemmLdA];
+    __shared__ __align__(32) float c_tile[kGemmBN * kGemmBM];  // [token][row]
+    if constexpr (TYPE == kIQ4_NL || TYPE == kIQ4_XS) {
+        if (threadIdx.x < 16) s_iq4nl[threadIdx.x] = c_iq4nl_values[threadIdx.x];
+    } else if constexpr (kGridBytes<TYPE> > 0) {
+        const uint8_t *src = grid_source<TYPE>();
+        for (int i = threadIdx.x; i < kGridBytes<TYPE>; i += blockDim.x) s_iq3s_grid[i] = src[i];
+    }
+    const int row0 = blockIdx.x * kGemmBM, tok0 = blockIdx.y * kGemmBN;
+    const int warp = threadIdx.x / 32;
+    const int wm = (warp / 2) * 32, wn = (warp % 2) * 32;  // this warp's 32 x 32 sub-tile
+    const int bs = block_size >= 8 ? block_size : 8;
+    const int chunks_per_block = bs / 8;
+    const int chunk_bytes_unq = 8 * type_size;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+    __syncthreads();
+    for (int k0 = 0; k0 < cols; k0 += kGemmBK) {
+        // Dequantize kGemmBM x kGemmBK weights: 256 chunks of 8 values, 2 per thread.
+        for (int c = threadIdx.x; c < kGemmBM * (kGemmBK / 8); c += blockDim.x) {
+            const int r = c / (kGemmBK / 8), kc = (k0 / 8) + c % (kGemmBK / 8);
+            float v[8];
+            if (row0 + r < rows) {
+                const uint8_t *w_row = w + static_cast<size_t>(row0 + r) * row_bytes;
+                if (block_size >= 8) {
+                    deq8<TYPE>(w_row + static_cast<size_t>(kc / chunks_per_block) * type_size, kc % chunks_per_block, v,
+                               s_iq4nl, s_iq3s_grid);
+                } else {
+                    deq8<TYPE>(w_row + static_cast<size_t>(kc) * chunk_bytes_unq, 0, v, s_iq4nl, s_iq3s_grid);
+                }
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) v[i] = 0.0f;
+            }
+            __half2 *dst = reinterpret_cast<__half2 *>(a_tile + r * kGemmLdA + (c % (kGemmBK / 8)) * 8);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) dst[i] = __floats2half2_rn(v[2 * i], v[2 * i + 1]);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < kGemmBK; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b[2];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], a_tile + (wm + 16 * i) * kGemmLdA + kk, kGemmLdA);
+#pragma unroll
+            for (int j = 0; j < 2; ++j)
+                wmma::load_matrix_sync(b[j], xh + static_cast<size_t>(tok0 + wn + 16 * j) * cols + k0 + kk, cols);
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int j = 0; j < 2; ++j) wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    // C[m = row][n = token] -> c_tile[token][row] (column-major in (row, token)), then guarded store.
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+            wmma::store_matrix_sync(c_tile + (wn + 16 * j) * kGemmBM + wm + 16 * i, acc[i][j], kGemmBM, wmma::mem_col_major);
+    __syncthreads();
+    for (int i = threadIdx.x; i < kGemmBN * kGemmBM; i += blockDim.x) {
+        const int t = i / kGemmBM, r = i % kGemmBM;
+        if (tok0 + t < ntok && row0 + r < rows) y[static_cast<size_t>(tok0 + t) * rows + row0 + r] = c_tile[i];
+    }
+}
+
+template <int TYPE>
+cudaError_t launch_qgemm_typed(const uint8_t *w, const __half *xh, float *y, int rows, int cols, int row_bytes,
+                               const TypeTraits &t, int ntok) {
+    const dim3 grid((rows + kGemmBM - 1) / kGemmBM, (ntok + kGemmBN - 1) / kGemmBN);
+    vinf_qgemm_kernel<TYPE><<<grid, 32 * kGemmWarps>>>(w, xh, y, rows, cols, row_bytes, ntok, t.block_size, t.type_size);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_qgemm(int type, const uint8_t *w, const __half *xh, float *y, int rows, int cols, int row_bytes,
+                         const TypeTraits &t, int ntok) {
+    switch (type) {
+        case kF32: return launch_qgemm_typed<kF32>(w, xh, y, rows, cols, row_bytes, t, ntok);
+        case kF16: return launch_qgemm_typed<kF16>(w, xh, y, rows, cols, row_bytes, t, ntok);
+        case kQ8_0: return launch_qgemm_typed<kQ8_0>(w, xh, y, rows, cols, row_bytes, t, ntok);
+        case kQ2_K: return launch_qgemm_typed<kQ2_K>(w, xh, y, rows, cols, row_bytes, t, ntok);
+        case kQ3_K: return launch_qgemm_typed<kQ3_K>(w, xh, y, rows, cols, row_bytes, t, ntok);
+        case kQ4_K: return launch_qgemm_typed<kQ4_K>(w, xh, y, rows, cols, row_bytes, t, ntok);
+        case kQ5_K: return launch_qgemm_typed<kQ5_K>(w, xh, y, rows, cols, row_bytes, t, ntok);
+        case kQ6_K: return launch_qgemm_typed<kQ6_K>(w, xh, y, rows, cols, row_bytes, t, ntok);
+        case kIQ4_NL: return launch_qgemm_typed<kIQ4_NL>(w, xh, y, rows, cols, row_bytes, t, ntok);
+        case kIQ3_S: return launch_qgemm_typed<kIQ3_S>(w, xh, y, rows, cols, row_bytes, t, ntok);
+        case kIQ4_XS: return launch_qgemm_typed<kIQ4_XS>(w, xh, y, rows, cols, row_bytes, t, ntok);
+        case kIQ2_XXS: return launch_qgemm_typed<kIQ2_XXS>(w, xh, y, rows, cols, row_bytes, t, ntok);
+        case kIQ2_XS: return launch_qgemm_typed<kIQ2_XS>(w, xh, y, rows, cols, row_bytes, t, ntok);
+        case kIQ2_S: return launch_qgemm_typed<kIQ2_S>(w, xh, y, rows, cols, row_bytes, t, ntok);
+        case kIQ3_XXS: return launch_qgemm_typed<kIQ3_XXS>(w, xh, y, rows, cols, row_bytes, t, ntok);
+        default: return cudaErrorInvalidValue;
+    }
+}
+
 cudaError_t launch_qmatvec(int type, const uint8_t *w, const float *x, float *y, int rows, int cols,
                            int row_bytes, const TypeTraits &t, int ntok = 1) {
     switch (type) {
@@ -567,6 +690,9 @@ struct RuntimeObject {
     float *scratch_y;
     size_t scratch_x_len;
     size_t scratch_y_len;
+    __half *gemm_x;  // fp16 activations for the tensor-core GEMM, [ntok rounded to kGemmBN][cols]
+    size_t gemm_x_len;
+    int gemm_min_rows;  // prompt-pass kernels (GEMM, tiled attention) from this many rows (0 = more than kMaxTokens)
 };
 
 PyObject *cuda_error(const char *context, cudaError_t err) {
@@ -758,6 +884,7 @@ void Runtime_dealloc(RuntimeObject *self) {
     }
     cudaFree(self->scratch_x);
     cudaFree(self->scratch_y);
+    cudaFree(self->gemm_x);
     Py_TYPE(self)->tp_free(reinterpret_cast<PyObject *>(self));
 }
 
@@ -1070,8 +1197,25 @@ PyObject *Runtime_qmv(RuntimeObject *self, PyObject *args) {
     if (err != cudaSuccess) return cuda_error(t->resident ? "qmv" : "qmv stream (staging too small?)", err);
     TypeTraits tt;
     type_traits(t->type, &tt);
-    // Wide passes (prompt processing): every group of kMaxTokens rows reuses the weight already in
-    // VRAM, so a streamed tensor crosses PCIe once for the whole pass.
+    const int gemm_from = self->gemm_min_rows > 0 ? self->gemm_min_rows : kMaxTokens + 1;
+    if (ntok >= gemm_from) {
+        // Prompt passes: tensor-core GEMM; the (possibly streamed) weight crosses PCIe once for all rows.
+        const int ntok_pad = (ntok + kGemmBN - 1) / kGemmBN * kGemmBN;
+        const size_t need = static_cast<size_t>(ntok_pad) * t->cols;
+        if (need > self->gemm_x_len) {
+            cudaFree(self->gemm_x);
+            self->gemm_x = nullptr;
+            self->gemm_x_len = 0;
+            err = cudaMalloc(&self->gemm_x, need * sizeof(__half));
+            if (err == cudaSuccess) self->gemm_x_len = need;
+        }
+        if (err == cudaSuccess) {
+            f32_to_f16_rows_kernel<<<blocks_for(need, 256), 256>>>(x, self->gemm_x, ntok, ntok_pad, t->cols);
+            err = launch_qgemm(t->type, w, self->gemm_x, y, t->rows, t->cols, t->row_bytes, tt, ntok);
+        }
+        ntok = 0;  // done
+    }
+    // Wide passes on the matvec kernel: every group of kMaxTokens rows reuses the weight already in VRAM.
     for (int c = 0; c < ntok && err == cudaSuccess; c += kMaxTokens) {
         const int m = ntok - c < kMaxTokens ? ntok - c : kMaxTokens;
         err = launch_qmatvec(t->type, w, x + static_cast<size_t>(c) * t->cols, y + static_cast<size_t>(c) * t->rows,
@@ -1189,7 +1333,8 @@ PyObject *Runtime_attention(RuntimeObject *self, PyObject *args) {
     float *o = vc ? find_buffer(self, oname, n) : nullptr;
     if (o == nullptr) return nullptr;
     const size_t smem = static_cast<size_t>(seq_len + ntok - 1) * sizeof(float);
-    if (ntok > kMaxTokens || smem > 32 * 1024) {
+    const bool prompt_pass = self->gemm_min_rows > 0 && ntok >= self->gemm_min_rows;
+    if (ntok > kMaxTokens || smem > 32 * 1024 || prompt_pass) {
         const size_t tsmem = attn_tiled_smem(hd);
         if (hd > 1024 || tsmem > 99 * 1024) return PyErr_Format(PyExc_ValueError, "head_dim %d too large", hd);
         static size_t tiled_attr = 0;
@@ -1407,7 +1552,17 @@ PyObject *Runtime_matvec(RuntimeObject *self, PyObject *args) {
     return out;
 }
 
+PyObject *Runtime_set_gemm_min_rows(RuntimeObject *self, PyObject *args) {
+    int n = 0;
+    if (!PyArg_ParseTuple(args, "i", &n)) return nullptr;
+    if (n < 0) return PyErr_Format(PyExc_ValueError, "gemm_min_rows must be >= 0");
+    self->gemm_min_rows = n;
+    Py_RETURN_NONE;
+}
+
 PyMethodDef Runtime_methods[] = {
+    {"set_gemm_min_rows", reinterpret_cast<PyCFunction>(Runtime_set_gemm_min_rows), METH_VARARGS,
+     "set_gemm_min_rows(n): passes of n or more rows use the prompt kernels (tensor-core GEMM, tiled attention); 0 = more than 8."},
     {"upload", reinterpret_cast<PyCFunction>(Runtime_upload), METH_VARARGS,
      "upload(name, raw_bytes, gguf_type_id, cols, rows): copy raw GGUF blocks to VRAM."},
     {"free", reinterpret_cast<PyCFunction>(Runtime_free), METH_VARARGS, "free(name): release a device tensor."},

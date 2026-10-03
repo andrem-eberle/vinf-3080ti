@@ -183,7 +183,7 @@ class QwenGpuExecutor:
         safety_bytes: int = 256 * 1024**2,
         stream_slots: int = 3,
         max_batch: int = 8,
-        prefill_batch: int = 64,
+        prefill_batch: int = 256,
         snapshot_tokens: int = 0,
         mtp: bool = False,
         placement: str = "hybrid",
@@ -269,7 +269,7 @@ class QwenGpuExecutor:
         self.gguf, self.metadata, self.max_context, self.head_order = gguf, metadata, max_context, 0
         self.stream_slots = 3
         self.max_batch, self.snapshot_tokens, self.last_ntok = 8, 0, 0
-        self.prefill_batch = 64
+        self.prefill_batch = 256
         self.mtp_layer = None
         self.placement, self.cpu_layers, self.cpu = "stream", frozenset(), None
         self.capture_layers, self.reserve_extra_bytes = (), 0
@@ -725,12 +725,21 @@ class QwenGpuExecutor:
             raise ConfigurationError(f"prefill from {start} but the executor is at position {self.position}")
         chunks = [(i, prompt_tokens[i : i + self.prefill_batch])
                   for i in range(start, len(prompt_tokens), self.prefill_batch)]
-        for idx, (i, chunk) in enumerate(chunks):
-            if idx == len(chunks) - 1 and before_last is not None:
-                before_last()
-            self.forward_tokens(chunk)
-            if observe is not None:
-                observe(i, chunk)
+        # Prompt passes use the tensor-core GEMM for every pass size, so the computed state does not
+        # depend on where a prompt is split (prefix-cache resumes match a fresh prefill).
+        gemm = getattr(self.rt, "set_gemm_min_rows", None)
+        if gemm is not None:
+            gemm(1)
+        try:
+            for idx, (i, chunk) in enumerate(chunks):
+                if idx == len(chunks) - 1 and before_last is not None:
+                    before_last()
+                self.forward_tokens(chunk)
+                if observe is not None:
+                    observe(i, chunk)
+        finally:
+            if gemm is not None:
+                gemm(0)
 
     # ---- state save / restore (prefix cache) ----------------------------------------------------
 
