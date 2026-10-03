@@ -1,0 +1,5 @@
+# Only the engine and the README are part of the repository.
+/*
+!/engine/
+!/README.md
+!/.gitignore
