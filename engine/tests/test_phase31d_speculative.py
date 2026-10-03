@@ -15,6 +15,7 @@ def executor_or_skip(test, gguf, meta, **kwargs):
     try:
         from vinf.qwen_gpu import QwenGpuExecutor
 
+        kwargs.setdefault("kv_dtype", "f32")  # parity with the fp32 CPU reference
         return QwenGpuExecutor(gguf, meta, max_context=32, **kwargs)
     except (ExecutorUnavailableError, RuntimeError) as exc:
         test.skipTest(f"CUDA qwen runtime unavailable: {exc}")

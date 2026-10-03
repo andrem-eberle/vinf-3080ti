@@ -379,6 +379,8 @@ class QwenMegakernelExecutor:
             raise ConfigurationError("streaming must be 'dma' or 'sm'")
         if base.cpu_layers:
             raise UnsupportedModelError("the megakernel needs every layer on the GPU; create the executor with placement='stream'")
+        if getattr(base, "kv_dtype", "f32") != "f32":
+            raise UnsupportedModelError("the megakernel reads fp32 KV caches; create the executor with kv_dtype='f32'")
         if base.head_order != HEAD_ORDERS["tiled"]:
             raise UnsupportedModelError("the megakernel implements the tiled SSM value-head order only")
         self.base = base

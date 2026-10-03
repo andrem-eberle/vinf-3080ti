@@ -91,22 +91,30 @@ __global__ void rope_neox_kernel(float *x, int ntok, int heads, int hd, int rot,
     head[j + half] = x1 * c + x0 * s;
 }
 
+// KV cache element access: fp32 or fp16 caches (fp16 halves the cache; attention math stays fp32).
+__device__ __forceinline__ float kv_load(const float *p) { return *p; }
+__device__ __forceinline__ float kv_load(const __half *p) { return __half2float(*p); }
+__device__ __forceinline__ void kv_store(float *p, float v) { *p = v; }
+__device__ __forceinline__ void kv_store(__half *p, float v) { *p = __float2half_rn(v); }
+
 // KV cache layout: [kv_head][max_seq][hd].
-__global__ void kv_append_kernel(const float *k, const float *v, float *kc, float *vc, int ntok, int kv_heads,
+template <typename T>
+__global__ void kv_append_kernel(const float *k, const float *v, T *kc, T *vc, int ntok, int kv_heads,
                                  int max_seq, int hd, int pos0) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= ntok * kv_heads * hd) return;
     const int t = i / (kv_heads * hd), h = (i / hd) % kv_heads, d = i % hd;
     const size_t dst = (static_cast<size_t>(h) * max_seq + pos0 + t) * hd + d;
-    kc[dst] = k[i];
-    vc[dst] = v[i];
+    kv_store(kc + dst, k[i]);
+    kv_store(vc + dst, v[i]);
 }
 
 // GQA attention: query token t (grid.y) attends to positions [start, seq_len0 + t) (causal) or
 // [start, seq_len0 + ntok - 1) for every token (bidirectional block, DFlash drafting).
 // window > 0 limits each query to its last `window` positions (sliding-window attention).
 // grid = (heads, ntok); dynamic smem = (seq_len0 + ntok - 1) floats.
-__global__ void attention_kernel(const float *q, const float *kc, const float *vc, float *out, int heads, int kv_heads,
+template <typename T>
+__global__ void attention_kernel(const float *q, const T *kc, const T *vc, float *out, int heads, int kv_heads,
                                  int hd, int max_seq, int seq_len0, float scale, int bidirectional, int window) {
     extern __shared__ float probs_all[];
     const int h = blockIdx.x, t = blockIdx.y;
@@ -116,13 +124,13 @@ __global__ void attention_kernel(const float *q, const float *kc, const float *v
     float *probs = probs_all - start;  // index by absolute position
     const int kvh = h / (heads / kv_heads);
     const float *qh = q + (static_cast<size_t>(t) * heads + h) * hd;
-    const float *kbase = kc + static_cast<size_t>(kvh) * max_seq * hd;
-    const float *vbase = vc + static_cast<size_t>(kvh) * max_seq * hd;
+    const T *kbase = kc + static_cast<size_t>(kvh) * max_seq * hd;
+    const T *vbase = vc + static_cast<size_t>(kvh) * max_seq * hd;
     float local_max = -INFINITY;
     for (int p = start + threadIdx.x; p < seq_len; p += blockDim.x) {
-        const float *kp = kbase + static_cast<size_t>(p) * hd;
+        const T *kp = kbase + static_cast<size_t>(p) * hd;
         float dot = 0.0f;
-        for (int d = 0; d < hd; ++d) dot += qh[d] * kp[d];
+        for (int d = 0; d < hd; ++d) dot += qh[d] * kv_load(kp + d);
         probs[p] = dot * scale;
         local_max = fmaxf(local_max, probs[p]);
     }
@@ -136,7 +144,7 @@ __global__ void attention_kernel(const float *q, const float *kc, const float *v
     float *o = out + (static_cast<size_t>(t) * heads + h) * hd;
     for (int d = threadIdx.x; d < hd; d += blockDim.x) {
         float acc = 0.0f;
-        for (int p = start; p < seq_len; ++p) acc += probs[p] * vbase[static_cast<size_t>(p) * hd + d];
+        for (int p = start; p < seq_len; ++p) acc += probs[p] * kv_load(vbase + static_cast<size_t>(p) * hd + d);
         o[d] = acc / denom;
     }
 }
@@ -154,7 +162,8 @@ __host__ __device__ constexpr size_t attn_tiled_smem(int hd) {
             kAttnTQ * kAttnTK + 3 * kAttnTQ) * sizeof(float);
 }
 
-__global__ void attention_tiled_kernel(const float *q, const float *kc, const float *vc, float *out, int heads,
+template <typename T>
+__global__ void attention_tiled_kernel(const float *q, const T *kc, const T *vc, float *out, int heads,
                                        int kv_heads, int hd, int max_seq, int seq_len0, int ntok, float scale,
                                        int bidirectional, int window) {
     extern __shared__ float smem[];
@@ -169,8 +178,8 @@ __global__ void attention_tiled_kernel(const float *q, const float *kc, const fl
     const int h = blockIdx.x, t0 = blockIdx.y * kAttnTQ, tid = threadIdx.x, nthr = blockDim.x;
     const int nq = min(kAttnTQ, ntok - t0);
     const int kvh = h / (heads / kv_heads);
-    const float *kbase = kc + static_cast<size_t>(kvh) * max_seq * hd;
-    const float *vbase = vc + static_cast<size_t>(kvh) * max_seq * hd;
+    const T *kbase = kc + static_cast<size_t>(kvh) * max_seq * hd;
+    const T *vbase = vc + static_cast<size_t>(kvh) * max_seq * hd;
     for (int i = tid; i < kAttnTQ * hd; i += nthr) {
         const int r = i / hd, d = i % hd;
         qs[r * ld + d] = r < nq ? q[(static_cast<size_t>(t0 + r) * heads + h) * hd + d] * scale : 0.0f;
@@ -195,8 +204,8 @@ __global__ void attention_tiled_kernel(const float *q, const float *kc, const fl
         for (int i = tid; i < kAttnTK * hd; i += nthr) {
             const int r = i / hd, d = i % hd;
             const bool in = r < nk;
-            ks[r * ld + d] = in ? kbase[static_cast<size_t>(k0 + r) * hd + d] : 0.0f;
-            vs[r * ld + d] = in ? vbase[static_cast<size_t>(k0 + r) * hd + d] : 0.0f;
+            ks[r * ld + d] = in ? kv_load(kbase + static_cast<size_t>(k0 + r) * hd + d) : 0.0f;
+            vs[r * ld + d] = in ? kv_load(vbase + static_cast<size_t>(k0 + r) * hd + d) : 0.0f;
         }
         __syncthreads();
         for (int i = tid; i < kAttnTQ * kAttnTK; i += nthr) {
@@ -638,7 +647,9 @@ struct DeviceTensor {
 
 struct DeviceBuffer {
     float *data = nullptr;
-    size_t n = 0;
+    size_t n = 0;     // elements
+    int elem = 4;     // bytes per element: 4 (fp32) or 2 (fp16 KV caches)
+    size_t bytes() const { return n * static_cast<size_t>(elem); }
 };
 
 // Prefetch ring for streamed tensors. Streamed weights are used in a fixed cyclic order
@@ -806,11 +817,39 @@ float *find_buffer(RuntimeObject *self, const char *name, size_t min_n) {
         PyErr_Format(PyExc_KeyError, "device buffer %s is not allocated", name);
         return nullptr;
     }
+    if (found->second.elem != 4) {
+        PyErr_Format(PyExc_TypeError, "device buffer %s is fp16 (KV cache), not fp32", name);
+        return nullptr;
+    }
     if (found->second.n < min_n) {
         PyErr_Format(PyExc_ValueError, "device buffer %s has %zu floats, need %zu", name, found->second.n, min_n);
         return nullptr;
     }
     return found->second.data;
+}
+
+// KV cache buffers may be fp32 or fp16; returns the raw pointer and the element size.
+void *find_kv_buffer(RuntimeObject *self, const char *name, size_t min_n, int *elem) {
+    auto found = self->buffers->find(name);
+    if (found == self->buffers->end()) {
+        PyErr_Format(PyExc_KeyError, "device buffer %s is not allocated", name);
+        return nullptr;
+    }
+    if (found->second.n < min_n) {
+        PyErr_Format(PyExc_ValueError, "KV buffer %s has %zu elements, need %zu", name, found->second.n, min_n);
+        return nullptr;
+    }
+    *elem = found->second.elem;
+    return found->second.data;
+}
+
+DeviceBuffer *find_any_buffer(RuntimeObject *self, const char *name) {
+    auto found = self->buffers->find(name);
+    if (found == self->buffers->end()) {
+        PyErr_Format(PyExc_KeyError, "device buffer %s is not allocated", name);
+        return nullptr;
+    }
+    return &found->second;
 }
 
 // F32 weight tensors used directly by elementwise kernels (norm weights, ssm_a, conv1d, ...).
@@ -1100,16 +1139,19 @@ PyObject *Runtime_set_stream_order(RuntimeObject *self, PyObject *args) {
 PyObject *Runtime_alloc(RuntimeObject *self, PyObject *args) {
     const char *name = nullptr;
     Py_ssize_t n = 0;
-    if (!PyArg_ParseTuple(args, "sn", &name, &n)) return nullptr;
+    int elem = 4;
+    if (!PyArg_ParseTuple(args, "sn|i", &name, &n, &elem)) return nullptr;
     if (n <= 0) return PyErr_Format(PyExc_ValueError, "buffer %s size must be positive", name);
+    if (elem != 4 && elem != 2) return PyErr_Format(PyExc_ValueError, "element size must be 4 (fp32) or 2 (fp16)");
     auto found = self->buffers->find(name);
     if (found != self->buffers->end()) {
         cudaFree(found->second.data);
         self->buffers->erase(found);
     }
     DeviceBuffer b;
-    cudaError_t err = cudaMalloc(&b.data, n * sizeof(float));
-    if (err == cudaSuccess) err = cudaMemset(b.data, 0, n * sizeof(float));
+    b.elem = elem;
+    cudaError_t err = cudaMalloc(&b.data, static_cast<size_t>(n) * elem);
+    if (err == cudaSuccess) err = cudaMemset(b.data, 0, static_cast<size_t>(n) * elem);
     if (err != cudaSuccess) {
         cudaFree(b.data);
         return cuda_error("cudaMalloc buffer", err);
@@ -1122,16 +1164,16 @@ PyObject *Runtime_alloc(RuntimeObject *self, PyObject *args) {
 PyObject *Runtime_zero(RuntimeObject *self, PyObject *args) {
     const char *name = nullptr;
     if (!PyArg_ParseTuple(args, "s", &name)) return nullptr;
-    float *buf = find_buffer(self, name, 0);
-    if (buf == nullptr) return nullptr;
-    cudaError_t err = cudaMemset(buf, 0, (*self->buffers)[name].n * sizeof(float));
+    DeviceBuffer *b = find_any_buffer(self, name);
+    if (b == nullptr) return nullptr;
+    cudaError_t err = cudaMemset(b->data, 0, b->bytes());
     if (err != cudaSuccess) return cuda_error("cudaMemset", err);
     Py_RETURN_NONE;
 }
 
 PyObject *Runtime_buffer_bytes(RuntimeObject *self, PyObject *) {
     size_t total = 0;
-    for (auto &item : *self->buffers) total += item.second.n * sizeof(float);
+    for (auto &item : *self->buffers) total += item.second.bytes();
     return PyLong_FromSize_t(total);
 }
 
@@ -1140,14 +1182,16 @@ PyObject *Runtime_write(RuntimeObject *self, PyObject *args) {
     Py_buffer data;
     Py_ssize_t offset = 0;
     if (!PyArg_ParseTuple(args, "sy*|n", &name, &data, &offset)) return nullptr;
-    float *buf = offset >= 0 ? find_buffer(self, name, static_cast<size_t>(offset) + static_cast<size_t>(data.len) / sizeof(float)) : nullptr;
-    if (buf == nullptr || data.len % sizeof(float) != 0) {
+    // Offsets and sizes are in buffer elements (float32, or float16 for fp16 KV caches).
+    DeviceBuffer *b = find_any_buffer(self, name);
+    if (b == nullptr || offset < 0 || data.len % b->elem != 0 ||
+        static_cast<size_t>(offset) + static_cast<size_t>(data.len) / b->elem > b->n) {
         PyBuffer_Release(&data);
-        if (buf != nullptr) PyErr_SetString(PyExc_ValueError, "write data must be float32 bytes");
-        else if (!PyErr_Occurred()) PyErr_SetString(PyExc_ValueError, "negative offset");
+        if (b != nullptr) PyErr_Format(PyExc_ValueError, "write to %s: bad offset/size for %d-byte elements", name, b->elem);
         return nullptr;
     }
-    cudaError_t err = cudaMemcpy(buf + offset, data.buf, data.len, cudaMemcpyHostToDevice);
+    cudaError_t err = cudaMemcpy(reinterpret_cast<char *>(b->data) + static_cast<size_t>(offset) * b->elem, data.buf,
+                                 data.len, cudaMemcpyHostToDevice);
     PyBuffer_Release(&data);
     if (err != cudaSuccess) return cuda_error("buffer write", err);
     Py_RETURN_NONE;
@@ -1157,15 +1201,16 @@ PyObject *Runtime_read(RuntimeObject *self, PyObject *args) {
     const char *name = nullptr;
     Py_ssize_t n = -1, offset = 0;
     if (!PyArg_ParseTuple(args, "s|nn", &name, &n, &offset)) return nullptr;
-    float *buf = find_buffer(self, name, 0);
-    if (buf == nullptr) return nullptr;
-    const size_t avail = (*self->buffers)[name].n;
+    DeviceBuffer *b = find_any_buffer(self, name);
+    if (b == nullptr) return nullptr;
+    const size_t avail = b->n;
     if (offset < 0 || static_cast<size_t>(offset) > avail) return PyErr_Format(PyExc_ValueError, "bad read offset");
     const size_t count = n < 0 ? avail - offset : static_cast<size_t>(n);
-    if (offset + count > avail) return PyErr_Format(PyExc_ValueError, "read of %zu floats exceeds buffer %s", count, name);
-    PyObject *out = PyBytes_FromStringAndSize(nullptr, static_cast<Py_ssize_t>(count * sizeof(float)));
+    if (offset + count > avail) return PyErr_Format(PyExc_ValueError, "read of %zu elements exceeds buffer %s", count, name);
+    PyObject *out = PyBytes_FromStringAndSize(nullptr, static_cast<Py_ssize_t>(count * b->elem));
     if (out == nullptr) return nullptr;
-    cudaError_t err = cudaMemcpy(PyBytes_AS_STRING(out), buf + offset, count * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaError_t err = cudaMemcpy(PyBytes_AS_STRING(out), reinterpret_cast<char *>(b->data) + static_cast<size_t>(offset) * b->elem,
+                                 count * b->elem, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         Py_DECREF(out);
         return cuda_error("buffer read", err);
@@ -1307,13 +1352,48 @@ PyObject *Runtime_kv_append(RuntimeObject *self, PyObject *args) {
         return PyErr_Format(PyExc_ValueError, "positions [%d, %d) outside KV cache of %d", pos, pos + ntok, max_seq);
     const size_t cache = static_cast<size_t>(kv_heads) * hd * max_seq;
     const size_t n = static_cast<size_t>(kv_heads) * hd * ntok;
+    int ke = 0, ve = 0;
     const float *k = find_buffer(self, kname, n);
     const float *v = k ? find_buffer(self, vname, n) : nullptr;
-    float *kc = v ? find_buffer(self, kcname, cache) : nullptr;
-    float *vc = kc ? find_buffer(self, vcname, cache) : nullptr;
+    void *kc = v ? find_kv_buffer(self, kcname, cache, &ke) : nullptr;
+    void *vc = kc ? find_kv_buffer(self, vcname, cache, &ve) : nullptr;
     if (vc == nullptr) return nullptr;
-    kv_append_kernel<<<blocks_for(n, 256), 256>>>(k, v, kc, vc, ntok, kv_heads, max_seq, hd, pos);
+    if (ke != ve) return PyErr_Format(PyExc_TypeError, "K and V caches differ in precision");
+    if (ke == 2)
+        kv_append_kernel<__half><<<blocks_for(n, 256), 256>>>(k, v, static_cast<__half *>(kc), static_cast<__half *>(vc),
+                                                              ntok, kv_heads, max_seq, hd, pos);
+    else
+        kv_append_kernel<float><<<blocks_for(n, 256), 256>>>(k, v, static_cast<float *>(kc), static_cast<float *>(vc),
+                                                             ntok, kv_heads, max_seq, hd, pos);
     return launch_result("kv_append");
+}
+
+template <typename T>
+PyObject *launch_attention(const T *kc, const T *vc, const float *q, float *o, int heads, int kv_heads, int hd,
+                           int max_seq, int seq_len, int ntok, int bidirectional, int window, bool prompt_pass) {
+    const size_t smem = static_cast<size_t>(seq_len + ntok - 1) * sizeof(float);
+    const float scale = 1.0f / sqrtf(static_cast<float>(hd));
+    if (ntok > kMaxTokens || smem > 32 * 1024 || prompt_pass) {
+        const size_t tsmem = attn_tiled_smem(hd);
+        if (hd > 1024 || tsmem > 99 * 1024) return PyErr_Format(PyExc_ValueError, "head_dim %d too large", hd);
+        static size_t tiled_attr = 0;
+        if (tsmem > 48 * 1024 && tsmem > tiled_attr) {
+            cudaError_t err = cudaFuncSetAttribute(attention_tiled_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                   static_cast<int>(tsmem));
+            if (err != cudaSuccess) return cuda_error("attention smem attribute", err);
+            tiled_attr = tsmem;
+        }
+        attention_tiled_kernel<T><<<dim3(heads, (ntok + kAttnTQ - 1) / kAttnTQ), hd, tsmem>>>(
+            q, kc, vc, o, heads, kv_heads, hd, max_seq, seq_len, ntok, scale, bidirectional, window);
+        return launch_result("attention");
+    }
+    if (smem > 48 * 1024) {
+        cudaError_t err = cudaFuncSetAttribute(attention_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+        if (err != cudaSuccess) return cuda_error("attention smem attribute", err);
+    }
+    attention_kernel<T><<<dim3(heads, ntok), 256, smem>>>(q, kc, vc, o, heads, kv_heads, hd, max_seq, seq_len, scale,
+                                                          bidirectional, window);
+    return launch_result("attention");
 }
 
 PyObject *Runtime_attention(RuntimeObject *self, PyObject *args) {
@@ -1327,35 +1407,19 @@ PyObject *Runtime_attention(RuntimeObject *self, PyObject *args) {
     if (ntok < 1 || seq_len <= 0 || seq_len + ntok - 1 > max_seq)
         return PyErr_Format(PyExc_ValueError, "invalid seq_len %d for %d tokens", seq_len, ntok);
     const size_t n = static_cast<size_t>(heads) * hd * ntok, cache = static_cast<size_t>(kv_heads) * hd * max_seq;
+    int ke = 0, ve = 0;
     const float *q = find_buffer(self, qname, n);
-    const float *kc = q ? find_buffer(self, kcname, cache) : nullptr;
-    const float *vc = kc ? find_buffer(self, vcname, cache) : nullptr;
+    const void *kc = q ? find_kv_buffer(self, kcname, cache, &ke) : nullptr;
+    const void *vc = kc ? find_kv_buffer(self, vcname, cache, &ve) : nullptr;
     float *o = vc ? find_buffer(self, oname, n) : nullptr;
     if (o == nullptr) return nullptr;
-    const size_t smem = static_cast<size_t>(seq_len + ntok - 1) * sizeof(float);
+    if (ke != ve) return PyErr_Format(PyExc_TypeError, "K and V caches differ in precision");
     const bool prompt_pass = self->gemm_min_rows > 0 && ntok >= self->gemm_min_rows;
-    if (ntok > kMaxTokens || smem > 32 * 1024 || prompt_pass) {
-        const size_t tsmem = attn_tiled_smem(hd);
-        if (hd > 1024 || tsmem > 99 * 1024) return PyErr_Format(PyExc_ValueError, "head_dim %d too large", hd);
-        static size_t tiled_attr = 0;
-        if (tsmem > 48 * 1024 && tsmem > tiled_attr) {
-            cudaError_t err = cudaFuncSetAttribute(attention_tiled_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                   static_cast<int>(tsmem));
-            if (err != cudaSuccess) return cuda_error("attention smem attribute", err);
-            tiled_attr = tsmem;
-        }
-        attention_tiled_kernel<<<dim3(heads, (ntok + kAttnTQ - 1) / kAttnTQ), hd, tsmem>>>(
-            q, kc, vc, o, heads, kv_heads, hd, max_seq, seq_len, ntok, 1.0f / sqrtf(static_cast<float>(hd)),
-            bidirectional, window);
-        return launch_result("attention");
-    }
-    if (smem > 48 * 1024) {
-        cudaError_t err = cudaFuncSetAttribute(attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
-        if (err != cudaSuccess) return cuda_error("attention smem attribute", err);
-    }
-    attention_kernel<<<dim3(heads, ntok), 256, smem>>>(q, kc, vc, o, heads, kv_heads, hd, max_seq, seq_len,
-                                                        1.0f / sqrtf(static_cast<float>(hd)), bidirectional, window);
-    return launch_result("attention");
+    if (ke == 2)
+        return launch_attention(static_cast<const __half *>(kc), static_cast<const __half *>(vc), q, o, heads, kv_heads, hd,
+                                max_seq, seq_len, ntok, bidirectional, window, prompt_pass);
+    return launch_attention(static_cast<const float *>(kc), static_cast<const float *>(vc), q, o, heads, kv_heads, hd,
+                            max_seq, seq_len, ntok, bidirectional, window, prompt_pass);
 }
 
 PyObject *Runtime_conv_update(RuntimeObject *self, PyObject *args) {
@@ -1552,6 +1616,13 @@ PyObject *Runtime_matvec(RuntimeObject *self, PyObject *args) {
     return out;
 }
 
+PyObject *Runtime_buffer_elem(RuntimeObject *self, PyObject *args) {
+    const char *name = nullptr;
+    if (!PyArg_ParseTuple(args, "s", &name)) return nullptr;
+    DeviceBuffer *b = find_any_buffer(self, name);
+    return b == nullptr ? nullptr : PyLong_FromLong(b->elem);
+}
+
 PyObject *Runtime_set_gemm_min_rows(RuntimeObject *self, PyObject *args) {
     int n = 0;
     if (!PyArg_ParseTuple(args, "i", &n)) return nullptr;
@@ -1561,6 +1632,8 @@ PyObject *Runtime_set_gemm_min_rows(RuntimeObject *self, PyObject *args) {
 }
 
 PyMethodDef Runtime_methods[] = {
+    {"buffer_elem", reinterpret_cast<PyCFunction>(Runtime_buffer_elem), METH_VARARGS,
+     "buffer_elem(name) -> bytes per element (4 = fp32, 2 = fp16)."},
     {"set_gemm_min_rows", reinterpret_cast<PyCFunction>(Runtime_set_gemm_min_rows), METH_VARARGS,
      "set_gemm_min_rows(n): passes of n or more rows use the prompt kernels (tensor-core GEMM, tiled attention); 0 = more than 8."},
     {"upload", reinterpret_cast<PyCFunction>(Runtime_upload), METH_VARARGS,

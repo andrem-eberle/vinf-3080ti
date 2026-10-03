@@ -24,8 +24,8 @@ def executors_or_skip(test: unittest.TestCase, gguf, meta, **kwargs):
         from vinf.qwen_gpu import QwenGpuExecutor
         from vinf.qwen_megakernel import QwenMegakernelExecutor
 
-        reference = QwenGpuExecutor(gguf, meta, max_context=16)
-        mk = QwenMegakernelExecutor(QwenGpuExecutor(gguf, meta, max_context=16, **kwargs))
+        reference = QwenGpuExecutor(gguf, meta, max_context=16, kv_dtype="f32")
+        mk = QwenMegakernelExecutor(QwenGpuExecutor(gguf, meta, max_context=16, kv_dtype="f32", **kwargs))
         return reference, mk
     except (ExecutorUnavailableError, RuntimeError) as exc:
         test.skipTest(f"CUDA megakernel unavailable: {exc}")
@@ -112,7 +112,7 @@ class Phase31bMegakernelTests(unittest.TestCase):
 
         expected = per_op_logits(reference, PROMPT)
         for streaming in ("dma", "sm"):
-            base = QwenGpuExecutor(gguf, meta, max_context=16, free_vram_bytes=tight, safety_bytes=0, placement="stream")
+            base = QwenGpuExecutor(gguf, meta, max_context=16, free_vram_bytes=tight, safety_bytes=0, placement="stream", kv_dtype="f32")
             mk = QwenMegakernelExecutor(base, streaming=streaming)
             self.assertGreater(len(mk.program.stream_order), 3)
             if streaming == "dma":

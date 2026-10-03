@@ -184,6 +184,7 @@ class QwenGpuExecutor:
         stream_slots: int = 3,
         max_batch: int = 8,
         prefill_batch: int = 256,
+        kv_dtype: str = "f16",
         snapshot_tokens: int = 0,
         mtp: bool = False,
         placement: str = "hybrid",
@@ -197,6 +198,8 @@ class QwenGpuExecutor:
             raise ConfigurationError("placement must be 'hybrid' (CPU computes layers that do not fit) or 'stream'")
         if not 1 <= max_batch <= MAX_BATCH:
             raise ConfigurationError(f"max_batch must be in [1, {MAX_BATCH}]")
+        if kv_dtype not in ("f16", "f32"):
+            raise ConfigurationError("kv_dtype must be 'f16' or 'f32'")
         if prefill_batch < 1:
             raise ConfigurationError("prefill_batch must be positive")
         if not 0 <= snapshot_tokens <= max_batch:
@@ -221,6 +224,8 @@ class QwenGpuExecutor:
         self.head_order = HEAD_ORDERS[head_order]
         self.stream_slots = stream_slots
         self.max_batch = max_batch
+        # GPU attention KV caches in fp16 halve their VRAM (attention math stays fp32); CPU layers keep fp32.
+        self.kv_dtype = kv_dtype
         # Rows per prompt-processing pass: each streamed weight crosses PCIe once per pass, so wide passes
         # make prefill compute-bound instead of PCIe-bound. DFlash feature capture keeps max_batch rows.
         self.prefill_batch = max(max_batch, prefill_batch) if not capture_layers else max_batch
@@ -270,6 +275,7 @@ class QwenGpuExecutor:
         self.stream_slots = 3
         self.max_batch, self.snapshot_tokens, self.last_ntok = 8, 0, 0
         self.prefill_batch = 256
+        self.kv_dtype = "f16"
         self.mtp_layer = None
         self.placement, self.cpu_layers, self.cpu = "stream", frozenset(), None
         self.capture_layers, self.reserve_extra_bytes = (), 0
@@ -389,6 +395,10 @@ class QwenGpuExecutor:
             specs[f"vc.{self.mtp_layer}"] = cache
         return specs
 
+    def _state_elem(self, name: str) -> int:
+        """Bytes per element of a GPU state buffer (fp16 attention KV caches)."""
+        return 2 if self.kv_dtype == "f16" and name.startswith(("kc.", "vc.")) else 4
+
     def _layer_of(self, name: str) -> int | None:
         return int(name.split(".")[1]) if name.split(".")[1].isdigit() else None
 
@@ -408,7 +418,7 @@ class QwenGpuExecutor:
         states = self._state_specs()
         fixed = sum(self._buffer_specs().values()) * 4 + 32 * 1024**2 + safety_bytes + self.reserve_extra_bytes
         fixed += sum(self.gguf.tensors[n].nbytes for n in ("output.weight", "output_norm.weight") + self._mtp_weight_names())
-        fixed += sum(v * 4 for n, v in states.items() if self._layer_of(n) == self.mtp_layer)
+        fixed += sum(v * self._state_elem(n) for n, v in states.items() if self._layer_of(n) == self.mtp_layer)
         budget = free_vram_bytes - fixed
         if budget < 0:
             raise InsufficientMemoryError(
@@ -418,7 +428,7 @@ class QwenGpuExecutor:
         used = 0
         for layer_idx in range(len(self.schedule)):
             cost = sum(self.gguf.tensors[n].nbytes for n in self._layer_weight_names(layer_idx))
-            cost += sum(v * 4 for n, v in states.items() if self._layer_of(n) == layer_idx)
+            cost += sum(v * self._state_elem(n) for n, v in states.items() if self._layer_of(n) == layer_idx)
             if used + cost > budget:
                 return frozenset(range(layer_idx, len(self.schedule)))
             used += cost
@@ -428,7 +438,7 @@ class QwenGpuExecutor:
         if free_vram_bytes is None:
             free_vram_bytes = self.rt.mem_info()[0]
         states = self._gpu_state_specs()
-        kv = sum(n for name, n in states.items() if name.startswith(("kc.", "vc."))) * 4
+        kv = sum(n * self._state_elem(name) for name, n in states.items() if name.startswith(("kc.", "vc.")))
         ssm = sum(n for name, n in states.items() if name.startswith(("conv", "ssm"))) * 4
         # + kernel/runtime slack + memory reserved for an external drafter (e.g. DFlash weights)
         activations = sum(self._buffer_specs().values()) * 4 + 32 * 1024**2 + self.reserve_extra_bytes
@@ -482,8 +492,13 @@ class QwenGpuExecutor:
         self.rt.set_stream_order(order, self.stream_slots)
 
     def _alloc_buffers(self) -> None:
-        for name, n in {**self._buffer_specs(), **self._gpu_state_specs()}.items():
+        for name, n in self._buffer_specs().items():
             self.rt.alloc(name, n)
+        for name, n in self._gpu_state_specs().items():
+            if self._state_elem(name) == 4:
+                self.rt.alloc(name, n)
+            else:
+                self.rt.alloc(name, n, self._state_elem(name))
         if self.cpu is not None:
             for name, n in {**self._buffer_specs(), **self._cpu_state_specs()}.items():
                 self.cpu.alloc(name, n)
@@ -753,7 +768,8 @@ class QwenGpuExecutor:
 
     def kv_bytes_per_token(self) -> int:
         s = self.shapes
-        return len(self._kv_layers()) * 2 * s.kv_heads * s.head_dim * 4
+        return sum(2 * s.kv_heads * s.head_dim * (4 if layer in self.cpu_layers else self._state_elem("kc."))
+                   for layer in self._kv_layers())
 
     def recurrent_bytes(self) -> int:
         specs = self._state_specs()

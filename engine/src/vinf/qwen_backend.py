@@ -124,6 +124,7 @@ class QwenBackend:
             snapshot_tokens=speculative + 1 if speculative > 0 else 0,
             max_batch=max(8, speculative + 1),
             prefill_batch=args.prefill_batch,
+            kv_dtype="f32" if args.executor == "megakernel" else args.kv_dtype,
             progress=progress,
         )
         log(executor.report())

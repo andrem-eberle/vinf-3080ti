@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 from array import array
 from typing import Sequence
 
@@ -102,8 +103,12 @@ class CudaWeightRuntime:
         return out.tolist()
 
     def read_floats(self, name: str, n: int = -1, offset: int = 0) -> list[float]:
+        """Buffer contents as floats (fp16 KV caches are widened)."""
+        data = self._rt.read(name, n, offset)
+        if self._rt.buffer_elem(name) == 2:
+            return list(struct.unpack(f"<{len(data) // 2}e", data))
         out = array("f")
-        out.frombytes(self._rt.read(name, n, offset))
+        out.frombytes(data)
         return out.tolist()
 
     def __getattr__(self, name: str):

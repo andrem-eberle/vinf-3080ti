@@ -88,6 +88,8 @@ class Phase31eHybridExecutorTests(unittest.TestCase):
     def executors(self, **kwargs):
         import dataclasses
 
+        kwargs.setdefault("kv_dtype", "f32")  # CPU layers keep fp32 KV; compare like with like
+
         from tests.test_phase30_qwen_gpu import gpu_fixture, gpu_metadata
 
         try:

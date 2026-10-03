@@ -131,6 +131,32 @@ class WidePrefillTests(unittest.TestCase):
             self.assertAlmostEqual(x, y, delta=1e-3)
 
 
+class Fp16KvCacheTests(unittest.TestCase):
+    def test_fp16_kv_halves_memory_and_tracks_fp32(self):
+        meta = dataclasses.replace(gpu_metadata(), max_position_embeddings=512)
+        gguf = gpu_fixture(meta)
+        f32 = executor_or_skip(self, gguf, meta, max_context=256, kv_dtype="f32")
+        f16 = executor_or_skip(self, gguf, meta, max_context=256)
+        self.assertEqual(f16.kv_dtype, "f16")
+        self.assertEqual(f16.rt.buffer_elem("kc.1"), 2)
+        self.assertEqual(2 * f16.kv_bytes_per_token(), f32.kv_bytes_per_token())
+        rng = random.Random(9)
+        prompt = [rng.randrange(5, 40) for _ in range(100)]
+        outs = []
+        for ex in (f32, f16):
+            ex.reset()
+            ex.prefill(prompt)
+            tokens = [ex.greedy_next()]
+            for _ in range(20):  # decode path (simple attention kernel)
+                ex.forward_token(tokens[-1])
+                tokens.append(ex.greedy_next())
+            outs.append((tokens, ex.logits()))
+        self.assertEqual(outs[0][0], outs[1][0])
+        scale = max(abs(v) for v in outs[0][1])
+        for a, b in zip(outs[0][1], outs[1][1]):
+            self.assertLessEqual(abs(a - b), 2e-2 * scale)
+
+
 class PrefixCacheTests(unittest.TestCase):
     def setUp(self):
         self.meta = dataclasses.replace(gpu_metadata(), max_position_embeddings=512)

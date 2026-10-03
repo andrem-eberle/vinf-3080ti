@@ -130,6 +130,8 @@ Useful options:
 | `--drafter mtp\|dflash`, `--dflash DIR` | choose the draft model; DFlash needs a checkpoint directory |
 | `--executor per-op\|megakernel` | per-op kernels (default) or one fused launch per token (no speculation) |
 | `--max-context N` | KV cache size (default 2048); smaller leaves more VRAM for weights |
+| `--kv-dtype f16\|f32` | attention KV cache precision (default f16: half the VRAM of f32) |
+| `--prefill-batch N` | prompt tokens per pass (default 256) |
 | `--no-think` | skip Qwen's reasoning block in chat mode |
 | `--safety-mib N` | VRAM left unallocated (default 256; raise if loading runs out of memory) |
 | `--profile` | per-op GPU timing breakdown |
@@ -220,7 +222,6 @@ Working: single-sequence greedy decoding of Qwen3.8-27B GGUF models on the RTX 3
 served from the CLI or an OpenAI-compatible HTTP API.
 Next:
 
-- fp16 KV cache (more weights resident at long contexts)
 - Concurrent multi-agent decoding (many sequences per pass for higher total throughput)
 - Temperature / top-k / top-p sampling with lossless speculative sampling
 - Smaller DFlash 2 draft footprint (4-bit draft weights, cheaper SSM snapshots)
