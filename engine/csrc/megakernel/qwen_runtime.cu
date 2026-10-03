@@ -252,6 +252,137 @@ __global__ void attention_tiled_kernel(const float *q, const T *kc, const T *vc,
     }
 }
 
+// Tensor-core attention for prompt passes (flash-style). A block takes kTcQ query tokens of one head and
+// walks the keys in kTcK-position tiles: S = Q K^T and O += P V run as 16x16x16 fp16 MMAs with fp32
+// accumulation; the online softmax and the output accumulator stay in fp32 shared memory.
+// Visibility rules match attention_kernel. head_dim must be a multiple of 16 and at most 256.
+// grid = (heads, ceil(ntok / kTcQ)), block = 32 * kTcWarps.
+constexpr int kTcQ = 32, kTcK = 32, kTcWarps = 4;
+
+__host__ __device__ constexpr int tc_ld_h(int hd) { return hd + 8; }  // fp16 row stride (keeps 32B fragment alignment)
+__host__ __device__ constexpr int tc_ld_o(int hd) { return hd + 8; }  // fp32 row stride
+__host__ __device__ constexpr size_t attn_tc_smem(int hd) {
+    return static_cast<size_t>(kTcQ) * tc_ld_h(hd) * 2      // Q fp16
+           + static_cast<size_t>(kTcK) * tc_ld_h(hd) * 2    // K, then V, fp16
+           + static_cast<size_t>(kTcQ) * (kTcK + 4) * 4     // S fp32
+           + static_cast<size_t>(kTcQ) * (kTcK + 8) * 2     // P fp16
+           + static_cast<size_t>(kTcQ) * tc_ld_o(hd) * 4    // O fp32
+           + 3 * kTcQ * 4;                                  // m, l, alpha
+}
+
+template <typename T>
+__global__ void __launch_bounds__(32 * kTcWarps) attention_tc_kernel(
+    const float *q, const T *kc, const T *vc, float *out, int heads, int kv_heads, int hd, int max_seq, int seq_len0,
+    int ntok, float scale, int bidirectional, int window) {
+    using namespace nvcuda;
+    extern __shared__ __align__(32) unsigned char tc_smem[];
+    const int ldh = tc_ld_h(hd), ldo = tc_ld_o(hd), lds = kTcK + 4, ldp = kTcK + 8;
+    __half *qs = reinterpret_cast<__half *>(tc_smem);
+    __half *kvs = qs + kTcQ * ldh;
+    float *ss = reinterpret_cast<float *>(kvs + kTcK * ldh);
+    __half *ps = reinterpret_cast<__half *>(ss + kTcQ * lds);
+    float *os = reinterpret_cast<float *>(ps + kTcQ * ldp);
+    float *row_m = os + kTcQ * ldo, *row_l = row_m + kTcQ, *row_a = row_l + kTcQ;
+    const int h = blockIdx.x, t0 = blockIdx.y * kTcQ, tid = threadIdx.x, nthr = blockDim.x, warp = tid / 32;
+    const int nq = min(kTcQ, ntok - t0);
+    const int kvh = h / (heads / kv_heads);
+    const T *kbase = kc + static_cast<size_t>(kvh) * max_seq * hd;
+    const T *vbase = vc + static_cast<size_t>(kvh) * max_seq * hd;
+    for (int i = tid; i < kTcQ * hd; i += nthr) {
+        const int r = i / hd, d = i % hd;
+        qs[r * ldh + d] = __float2half_rn(r < nq ? q[(static_cast<size_t>(t0 + r) * heads + h) * hd + d] * scale : 0.0f);
+        os[r * ldo + d] = 0.0f;
+    }
+    if (tid < kTcQ) {
+        row_m[tid] = -INFINITY;
+        row_l[tid] = 0.0f;
+    }
+    auto q_end = [&](int r) { return bidirectional ? seq_len0 + ntok - 1 : seq_len0 + t0 + r; };
+    auto q_start = [&](int r) {
+        const int qpos1 = seq_len0 + t0 + r;
+        return window > 0 && qpos1 > window ? qpos1 - window : 0;
+    };
+    const int kbeg = q_start(0), kend = q_end(nq - 1);
+    __syncthreads();
+    for (int k0 = kbeg - kbeg % kTcK; k0 < kend; k0 += kTcK) {
+        const int nk = min(kTcK, kend - k0);
+        for (int i = tid; i < kTcK * hd; i += nthr) {
+            const int r = i / hd, d = i % hd;
+            kvs[r * ldh + d] = __float2half_rn(r < nk ? kv_load(kbase + static_cast<size_t>(k0 + r) * hd + d) : 0.0f);
+        }
+        __syncthreads();
+        {  // S = Q K^T: 2 x 2 fragments of 16 x 16, one per warp
+            const int fr = (warp / 2) * 16, fc = (warp % 2) * 16;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+            for (int d = 0; d < hd; d += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
+                wmma::load_matrix_sync(a, qs + fr * ldh + d, ldh);
+                wmma::load_matrix_sync(b, kvs + fc * ldh + d, ldh);
+                wmma::mma_sync(acc, a, b, acc);
+            }
+            wmma::store_matrix_sync(ss + fr * lds + fc, acc, lds, wmma::mem_row_major);
+        }
+        __syncthreads();
+        // V tile replaces K; the softmax update runs alongside.
+        for (int i = tid; i < kTcK * hd; i += nthr) {
+            const int r = i / hd, d = i % hd;
+            kvs[r * ldh + d] = __float2half_rn(r < nk ? kv_load(vbase + static_cast<size_t>(k0 + r) * hd + d) : 0.0f);
+        }
+        if (tid < kTcQ) {
+            const int r = tid;
+            const int lo = q_start(r), hi = q_end(r);
+            float m = row_m[r];
+            for (int c = 0; c < kTcK; ++c) {
+                const int pos = k0 + c;
+                if (r < nq && c < nk && pos >= lo && pos < hi) m = fmaxf(m, ss[r * lds + c]);
+            }
+            const float a = m == -INFINITY ? 1.0f : expf(row_m[r] - m);
+            float l = row_l[r] * a;
+            for (int c = 0; c < kTcK; ++c) {
+                const int pos = k0 + c;
+                const bool ok = r < nq && c < nk && pos >= lo && pos < hi;
+                const float e = ok ? expf(ss[r * lds + c] - m) : 0.0f;
+                ps[r * ldp + c] = __float2half_rn(e);
+                l += e;
+            }
+            row_m[r] = m;
+            row_l[r] = l;
+            row_a[r] = a;
+        }
+        __syncthreads();
+        for (int i = tid; i < kTcQ * hd; i += nthr) {
+            const int r = i / hd, d = i % hd;
+            os[r * ldo + d] *= row_a[r];
+        }
+        __syncthreads();
+        {  // O += P V: rows (warp / 2) * 16, column fragments split between warp pairs
+            const int fr = (warp / 2) * 16;
+            const int nfrag = hd / 16;
+            for (int f = warp % 2; f < nfrag; f += 2) {
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+                wmma::load_matrix_sync(acc, os + fr * ldo + f * 16, ldo, wmma::mem_row_major);
+#pragma unroll
+                for (int kk = 0; kk < kTcK; kk += 16) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b;
+                    wmma::load_matrix_sync(a, ps + fr * ldp + kk, ldp);
+                    wmma::load_matrix_sync(b, kvs + kk * ldh + f * 16, ldh);
+                    wmma::mma_sync(acc, a, b, acc);
+                }
+                wmma::store_matrix_sync(os + fr * ldo + f * 16, acc, ldo, wmma::mem_row_major);
+            }
+        }
+        __syncthreads();
+    }
+    for (int i = tid; i < nq * hd; i += nthr) {
+        const int r = i / hd, d = i % hd;
+        const float l = row_l[r];
+        out[(static_cast<size_t>(t0 + r) * heads + h) * hd + d] = l > 0.0f ? os[r * ldo + d] / l : 0.0f;
+    }
+}
+
 // Causal depthwise conv + SiLU stepping through ntok tokens. state: [channel][K] (last K inputs).
 // snap (optional): state after each token, [ntok][channel][K].
 __global__ void conv_update_kernel(const float *x, float *state, const float *w, float *out, int channels, int K,
@@ -270,6 +401,93 @@ __global__ void conv_update_kernel(const float *x, float *state, const float *w,
             for (int k = 0; k < K; ++k) dst[k] = st[k];
         }
     }
+}
+
+// Gated delta rule with the state in registers. Every state column j evolves independently given the
+// token's normalized q/k, so a block takes 32 columns of one value head (grid = value_heads x vd/32) and
+// kGdP warps split the kd rows: thread (warp p, lane c) holds rows [p*R, (p+1)*R) of column 32*by + c
+// (R = kd / kGdP) for the whole pass. The state is read and written once per call instead of per token;
+// per token the block needs three barriers (q/k norms, k.S reduction, q.S reduction).
+constexpr int kGdP = 4;
+
+template <int R>
+__global__ void __launch_bounds__(32 * kGdP) gated_delta_reg_kernel(
+    const float *conv_out, const float *beta_raw, const float *alpha_raw, const float *ssm_a, const float *dt_bias,
+    float *state, float *out, int key_heads, int value_heads, int vd, float eps, int head_order, int ntok, float *snap) {
+    constexpr int kd = R * kGdP;
+    __shared__ float qraw[kd], kraw[kd];
+    __shared__ float red_n[2][kGdP], red_k[kGdP][32], red_o[kGdP][32];
+    const int h = blockIdx.x, lane = threadIdx.x % 32, p = threadIdx.x / 32;
+    const int j = blockIdx.y * 32 + lane;
+    const int kh = head_order == 0 ? h / (value_heads / key_heads) : h % key_heads;
+    const int conv_dim = 2 * key_heads * kd + value_heads * vd;
+    float *S = state + static_cast<size_t>(h) * kd * vd;
+    float st[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) st[r] = S[static_cast<size_t>(p * R + r) * vd + j];
+    const float a_h = ssm_a[h], dt_h = dt_bias[h];
+    for (int t = 0; t < ntok; ++t) {
+        const float *row = conv_out + static_cast<size_t>(t) * conv_dim;
+        const float *qsrc = row + kh * kd;
+        const float *ksrc = row + key_heads * kd + kh * kd;
+        float qs = 0.0f, ks = 0.0f;
+        for (int i = threadIdx.x; i < kd; i += blockDim.x) {
+            const float qv = qsrc[i], kv = ksrc[i];
+            qraw[i] = qv;
+            kraw[i] = kv;
+            qs += qv * qv;
+            ks += kv * kv;
+        }
+        qs = warp_sum(qs);
+        ks = warp_sum(ks);
+        if (lane == 0) {
+            red_n[0][p] = qs;
+            red_n[1][p] = ks;
+        }
+        const float vj = row[2 * key_heads * kd + h * vd + j];
+        const float beta = sigmoid_f(beta_raw[static_cast<size_t>(t) * value_heads + h]);
+        const float xa = alpha_raw[static_cast<size_t>(t) * value_heads + h] + dt_h;
+        const float decay = expf(a_h * (xa > 20.0f ? xa : log1pf(expf(xa))));
+        __syncthreads();
+        float qsum = 0.0f, ksum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kGdP; ++w) {
+            qsum += red_n[0][w];
+            ksum += red_n[1][w];
+        }
+        const float qscale = 1.0f / (sqrtf(qsum + eps) * sqrtf(static_cast<float>(kd)));
+        const float kscale = 1.0f / sqrtf(ksum + eps);
+        float kv_mem = 0.0f;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            st[r] *= decay;
+            kv_mem += st[r] * (kraw[p * R + r] * kscale);
+        }
+        red_k[p][lane] = kv_mem;
+        __syncthreads();
+        float kv_all = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kGdP; ++w) kv_all += red_k[w][lane];
+        const float delta = (vj - kv_all) * beta;
+        float o = 0.0f;
+        float *snap_t = (snap != nullptr && t < ntok - 1) ? snap + (static_cast<size_t>(t) * value_heads + h) * kd * vd : nullptr;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            st[r] += (kraw[p * R + r] * kscale) * delta;
+            o += st[r] * (qraw[p * R + r] * qscale);
+            if (snap_t != nullptr) snap_t[static_cast<size_t>(p * R + r) * vd + j] = st[r];
+        }
+        red_o[p][lane] = o;
+        __syncthreads();
+        if (p == 0) {
+            float o_all = 0.0f;
+#pragma unroll
+            for (int w = 0; w < kGdP; ++w) o_all += red_o[w][lane];
+            out[static_cast<size_t>(t) * value_heads * vd + h * vd + j] = o_all;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) S[static_cast<size_t>(p * R + r) * vd + j] = st[r];
 }
 
 // Gated delta rule stepping through ntok tokens. grid = value_heads, block = vd threads (thread j owns
@@ -1373,6 +1591,19 @@ PyObject *launch_attention(const T *kc, const T *vc, const float *q, float *o, i
                            int max_seq, int seq_len, int ntok, int bidirectional, int window, bool prompt_pass) {
     const size_t smem = static_cast<size_t>(seq_len + ntok - 1) * sizeof(float);
     const float scale = 1.0f / sqrtf(static_cast<float>(hd));
+    if ((ntok > kMaxTokens || prompt_pass) && hd % 16 == 0 && attn_tc_smem(hd) <= 99 * 1024) {
+        const size_t csmem = attn_tc_smem(hd);
+        static size_t tc_attr = 0;
+        if (csmem > 48 * 1024 && csmem > tc_attr) {
+            cudaError_t err = cudaFuncSetAttribute(attention_tc_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                   static_cast<int>(csmem));
+            if (err != cudaSuccess) return cuda_error("attention smem attribute", err);
+            tc_attr = csmem;
+        }
+        attention_tc_kernel<T><<<dim3(heads, (ntok + kTcQ - 1) / kTcQ), 32 * kTcWarps, csmem>>>(
+            q, kc, vc, o, heads, kv_heads, hd, max_seq, seq_len, ntok, scale, bidirectional, window);
+        return launch_result("attention");
+    }
     if (ntok > kMaxTokens || smem > 32 * 1024 || prompt_pass) {
         const size_t tsmem = attn_tiled_smem(hd);
         if (hd > 1024 || tsmem > 99 * 1024) return PyErr_Format(PyExc_ValueError, "head_dim %d too large", hd);
@@ -1465,6 +1696,16 @@ PyObject *Runtime_gated_delta(RuntimeObject *self, PyObject *args) {
     if (snapname != nullptr) {
         snap = find_buffer(self, snapname, state_n * (ntok - 1));
         if (snap == nullptr) return nullptr;
+    }
+    if (vd % 32 == 0 && (kd == 32 || kd == 64 || kd == 128 || kd == 256)) {
+        const dim3 grid(value_heads, vd / 32);
+        switch (kd) {
+            case 32: gated_delta_reg_kernel<8><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
+            case 64: gated_delta_reg_kernel<16><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
+            case 128: gated_delta_reg_kernel<32><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
+            default: gated_delta_reg_kernel<64><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
+        }
+        return launch_result("gated_delta");
     }
     const int threads = vd < 32 ? 32 : ((vd + 31) / 32) * 32;
     gated_delta_kernel<<<value_heads, threads, 2 * kd * sizeof(float)>>>(conv, b, a, ssm_a, dt, st, o, key_heads,

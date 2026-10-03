@@ -67,7 +67,7 @@ class TiledAttentionTests(unittest.TestCase):
         got = rt.read_floats("o")
         want = reference_attention(q, kc, vc, heads, kv_heads, hd, max_seq, seq_len0, ntok, bidirectional, window)
         for idx, (a, b) in enumerate(zip(got, want)):
-            self.assertAlmostEqual(a, b, delta=1e-4, msg=idx)
+            self.assertAlmostEqual(a, b, delta=2e-3, msg=idx)  # tensor-core path: fp16 Q/K/V/P
 
     def test_causal_wide_pass(self):
         self.check(ntok=37, seq_len0=20)  # several query tiles, partial tiles, keys before the pass
@@ -78,6 +78,69 @@ class TiledAttentionTests(unittest.TestCase):
     def test_bidirectional_and_window(self):
         self.check(ntok=12, seq_len0=40, bidirectional=1)
         self.check(ntok=24, seq_len0=30, window=19)
+
+
+class GatedDeltaKernelTests(unittest.TestCase):
+    """Register-resident gated delta kernel (kd in {32, 64, 128, 256}, vd % 32 == 0) vs a numpy reference."""
+
+    def check(self, kh, vh, kd, vd, ntok, head_order, snapshot):
+        import numpy as np
+
+        from vinf.gguf.parser import GGUFTensorType
+
+        rt = runtime_or_skip(self)
+        rng = np.random.default_rng(kd + vd + ntok)
+        conv_dim = 2 * kh * kd + vh * vd
+        conv = rng.uniform(-1, 1, (ntok, conv_dim)).astype(np.float32)
+        beta = rng.uniform(-2, 2, (ntok, vh)).astype(np.float32)
+        alpha = rng.uniform(-2, 2, (ntok, vh)).astype(np.float32)
+        ssm_a = -rng.uniform(0.1, 1.0, vh).astype(np.float32)
+        dt = rng.uniform(-1, 1, vh).astype(np.float32)
+        state0 = rng.uniform(-0.5, 0.5, (vh, kd, vd)).astype(np.float32)
+        for name, arr in (("c", conv), ("b", beta), ("a", alpha), ("st", state0)):
+            rt.alloc(name, arr.size)
+            rt.write(name, arr.tobytes())
+        rt.alloc("o", ntok * vh * vd)
+        rt.upload_raw("ssm_a", ssm_a.tobytes(), GGUFTensorType.F32, vh, 1)
+        rt.upload_raw("dt", dt.tobytes(), GGUFTensorType.F32, vh, 1)
+        if snapshot:
+            rt.alloc("snap", (ntok - 1) * vh * kd * vd)
+        rt.gated_delta("c", "b", "a", "ssm_a", "dt", "st", "o", kh, vh, kd, vd, 1e-6, head_order, ntok,
+                       "snap" if snapshot else None)
+        S = state0.astype(np.float64).copy()
+        out = np.zeros((ntok, vh, vd))
+        snaps = []
+        for t in range(ntok):
+            for h in range(vh):
+                k_h = h // (vh // kh) if head_order == 0 else h % kh
+                q = conv[t, k_h * kd : (k_h + 1) * kd].astype(np.float64)
+                k = conv[t, kh * kd + k_h * kd : kh * kd + (k_h + 1) * kd].astype(np.float64)
+                v = conv[t, 2 * kh * kd + h * vd : 2 * kh * kd + (h + 1) * vd].astype(np.float64)
+                q = q / (np.sqrt((q * q).sum() + 1e-6) * np.sqrt(kd))
+                k = k / np.sqrt((k * k).sum() + 1e-6)
+                xa = alpha[t, h] + dt[h]
+                decay = np.exp(ssm_a[h] * (xa if xa > 20 else np.log1p(np.exp(xa))))
+                b = 1 / (1 + np.exp(-beta[t, h]))
+                S[h] *= decay
+                delta = (v - k @ S[h]) * b
+                S[h] += np.outer(k, delta)
+                out[t, h] = q @ S[h]
+            snaps.append(S.copy())
+        got = np.frombuffer(rt.read("o"), dtype=np.float32).reshape(ntok, vh, vd)
+        np.testing.assert_allclose(got, out, rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(np.frombuffer(rt.read("st"), dtype=np.float32).reshape(vh, kd, vd), S, rtol=1e-4, atol=1e-4)
+        if snapshot:
+            snap = np.frombuffer(rt.read("snap"), dtype=np.float32).reshape(ntok - 1, vh, kd, vd)
+            np.testing.assert_allclose(snap, np.array(snaps[:-1]), rtol=1e-4, atol=1e-4)
+
+    def test_small_heads_with_snapshots(self):
+        self.check(2, 4, 32, 64, 9, 1, True)
+
+    def test_grouped_order(self):
+        self.check(2, 4, 64, 32, 5, 0, False)
+
+    def test_model_head_dims(self):
+        self.check(2, 6, 128, 128, 12, 1, True)
 
 
 class TensorCoreGemmTests(unittest.TestCase):
