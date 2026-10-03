@@ -11,21 +11,28 @@ The engine has been tested mostly with **Qwen3.8-27B** (UD-Q3_K_XL and UD-Q4_K_M
 
 ## Benchmarks
 
-Measured on an RTX 3080 Ti (PCIe 4.0 x16, desktop session holding ~0.9 GB VRAM), greedy decoding,
-120 new tokens, chat prompt *"Write a short paragraph about the history of the Roman Empire."* (`--no-think`),
-`max_context` 2048. Speculative modes produce output identical to plain greedy decoding.
+Measured on an RTX 3080 Ti (PCIe 4.0 x16, desktop session holding ~1.2 GB VRAM), greedy decoding.
+Decode: 120 new tokens, chat prompt *"Write a short paragraph about the history of the Roman Empire."* (`--no-think`).
+Prefill: a 1910-token prompt, cold (no prefix cache). Speculative modes produce output identical to plain greedy decoding.
 
 ### Qwen3.8-27B UD-Q3_K_XL (12.2 GiB GGUF)
 
-| Mode | Decode tok/s | Tokens / pass | Weights on GPU | Streamed / pass |
-|---|---:|---:|---:|---:|
-| **stream + MTP speculation, k=3 (default)** | **12.30** | 2.53 | 9.17 GiB | 2.55 GiB |
-| stream + DFlash 2 draft, k=4 | 10.52 | 2.83 | 7.43 GiB | 3.97 GiB |
-| stream, no speculation | 7.94 | 1 | 9.53 GiB | 1.87 GiB |
+| Context | Mode | KV cache | Prefill tok/s | Decode tok/s | Weights on GPU |
+|---:|---|---|---:|---:|---:|
+| 2048 | **stream + MTP speculation, k=3 (default)** | fp16 | 206 | **11.66** | 8.81 GiB |
+| 2048 | stream, no speculation | fp16 | 265 | 7.55 | 9.35 GiB |
+| 32768 | stream + MTP speculation, k=3 | fp16 | 205 | 8.96 | 6.86 GiB |
+| 32768 | stream + MTP speculation, k=3 | fp32 | 208 | 7.13 | 4.73 GiB |
+| 32768 | stream, no speculation | fp16 | 267 | 4.91 | 7.46 GiB |
 
-Prefill: 24-token prompt in 0.6-0.9 s.
+MTP accepts 2.53 tokens per pass on this prompt. With MTP, prefill also runs the draft block over the prompt
+(~22% slower prefill, much faster decode). Follow-up turns of a conversation resume from the prefix cache and only
+process their new tokens.
 
-### Qwen3.8-27B UD-Q4_K_M (16.4 GiB GGUF)
+Earlier build (fp32 KV, 8-token prefill passes), context 2048: DFlash 2 draft k=4 decoded at 10.52 tok/s
+(2.83 tokens / pass).
+
+### Qwen3.8-27B UD-Q4_K_M (16.4 GiB GGUF, earlier build: fp32 KV, 8-token prefill passes)
 
 | Mode | Decode tok/s |
 |---|---:|
