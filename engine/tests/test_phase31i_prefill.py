@@ -133,6 +133,54 @@ class GatedDeltaKernelTests(unittest.TestCase):
             snap = np.frombuffer(rt.read("snap"), dtype=np.float32).reshape(ntok - 1, vh, kd, vd)
             np.testing.assert_allclose(snap, np.array(snaps[:-1]), rtol=1e-4, atol=1e-4)
 
+    def test_fp16_state_through_segments(self):
+        import numpy as np
+
+        from vinf.gguf.parser import GGUFTensorType
+
+        rt = runtime_or_skip(self)
+        kh, vh, kd, vd, ntok = 2, 4, 64, 64, 7
+        rng = np.random.default_rng(5)
+        conv_dim = 2 * kh * kd + vh * vd
+        conv = rng.uniform(-1, 1, (ntok, conv_dim)).astype(np.float32)
+        beta = rng.uniform(-2, 2, (ntok, vh)).astype(np.float32)
+        alpha = rng.uniform(-2, 2, (ntok, vh)).astype(np.float32)
+        ssm_a = -rng.uniform(0.1, 1.0, vh).astype(np.float32)
+        dt = rng.uniform(-1, 1, vh).astype(np.float32)
+        state0 = rng.uniform(-0.5, 0.5, (2, vh, kd, vd)).astype(np.float16)  # 2 slots; slot 1 used
+        for name, arr in (("c", conv), ("b", beta), ("a", alpha)):
+            rt.alloc(name, arr.size)
+            rt.write(name, arr.tobytes())
+        rt.alloc("st", state0.size, 2)
+        rt.write("st", state0.tobytes())
+        rt.alloc("o", ntok * vh * vd)
+        rt.alloc("pt", 2)
+        rt.write("pt", array("i", [0, 0]).tobytes())
+        rt.set_paging("pt", 64, 1, 2)
+        rt.set_segments([(1, 0, ntok)])
+        rt.upload_raw("ssm_a", ssm_a.tobytes(), GGUFTensorType.F32, vh, 1)
+        rt.upload_raw("dt", dt.tobytes(), GGUFTensorType.F32, vh, 1)
+        rt.gated_delta_seg("c", "b", "a", "ssm_a", "dt", "st", "o", kh, vh, kd, vd, 1e-6, 1)
+        S = state0[1].astype(np.float64)
+        out = np.zeros((ntok, vh, vd))
+        for t in range(ntok):
+            for h in range(vh):
+                k_h = h % kh
+                q = conv[t, k_h * kd : (k_h + 1) * kd].astype(np.float64)
+                k = conv[t, kh * kd + k_h * kd : kh * kd + (k_h + 1) * kd].astype(np.float64)
+                v = conv[t, 2 * kh * kd + h * vd : 2 * kh * kd + (h + 1) * vd].astype(np.float64)
+                q = q / (np.sqrt((q * q).sum() + 1e-6) * np.sqrt(kd))
+                k = k / np.sqrt((k * k).sum() + 1e-6)
+                xa = alpha[t, h] + dt[h]
+                S[h] *= np.exp(ssm_a[h] * (xa if xa > 20 else np.log1p(np.exp(xa))))
+                S[h] += np.outer(k, (v - k @ S[h]) / (1 + np.exp(-beta[t, h])))
+                out[t, h] = q @ S[h]
+        got = np.frombuffer(rt.read("o"), dtype=np.float32).reshape(ntok, vh, vd)
+        np.testing.assert_allclose(got, out, rtol=1e-3, atol=1e-3)  # fp32 math on the fp16 initial state
+        st = np.frombuffer(rt.read("st"), dtype=np.float16).reshape(2, vh, kd, vd)
+        np.testing.assert_allclose(st[1].astype(np.float64), S, rtol=2e-3, atol=2e-3)  # rounded once
+        np.testing.assert_array_equal(st[0], state0[0])  # other slot untouched
+
     def test_small_heads_with_snapshots(self):
         self.check(2, 4, 32, 64, 9, 1, True)
 

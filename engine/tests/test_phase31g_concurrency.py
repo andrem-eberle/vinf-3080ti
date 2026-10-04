@@ -59,7 +59,7 @@ def prompts(n, seed=11, lo=40, hi=150):
 def solo(test, prompt_list, max_new):
     """Reference: each prompt alone on a fresh single-sequence executor, plain greedy."""
     meta, gguf = fixture()
-    ex = executor_or_skip(test, gguf, meta)
+    ex = executor_or_skip(test, gguf, meta, batch_kernels=True)  # the kernels concurrent serving uses
     return [ex.generate_greedy(p, max_new)[0] for p in prompt_list]
 
 
@@ -114,6 +114,30 @@ class SchedulerTests(unittest.TestCase):
         b = backend(self, speculative=3, max_seqs=3, kv_pool_tokens=2048)
         jobs, sched = self.check(b, prompts(3, seed=4), [14, 6, 10])
         self.assertGreater(sched.spec_passes, 0)  # drafts verified for several sequences in one pass
+
+    def test_more_sequences_than_one_matvec_group(self):
+        # 12 sequences; verification rows capped at 24 -> 1 draft per sequence when all generate.
+        b = backend(self, speculative=3, max_seqs=12, kv_pool_tokens=4096, verify_rows=24)
+        jobs, sched = self.check(b, prompts(12, seed=17, lo=20, hi=60), [8] * 12)
+        self.assertGreater(sched.spec_passes, 0)
+
+    def test_batched_drafts_match_single_drafts(self):
+        b = backend(self, speculative=3, max_seqs=3, kv_pool_tokens=2048)
+        ex, drafter = b.base, b.decoder.drafter
+        ps = prompts(3, seed=2)
+        seqs = []
+        for p in ps:
+            seq = ex.seq if not seqs else ex.new_sequence()
+            ex.activate(seq)
+            ex.reset()
+            drafter.bind(seq)
+            ex.prefill(p, observe=lambda i, c, p=p: drafter.observe_prefill(i, c, p))
+            seqs.append((seq, ex.greedy_next()))
+        many = drafter.draft_many([s for s, _ in seqs], [t for _, t in seqs], [3, 1, 2])
+        for (seq, t), k, got in zip(seqs, [3, 1, 2], many):
+            ex.activate(seq)
+            drafter.bind(seq)
+            self.assertEqual(drafter.draft(t, seq.position, k), got)
 
     def test_prefix_resume_and_shared_prefix_copy(self):
         b = backend(self, speculative=3, max_seqs=3, kv_pool_tokens=2048)

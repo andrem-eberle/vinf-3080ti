@@ -150,6 +150,8 @@ class QwenBackend:
             max_seqs=1 if dflash_ck is not None else max_seqs,
             kv_pool_tokens=getattr(args, "kv_pool_tokens", None),
             page_size=args.max_context if args.executor == "megakernel" else 256,
+            ssm_dtype=getattr(args, "ssm_dtype", "f32"),
+            verify_rows=getattr(args, "verify_rows", 64),
             progress=progress,
         )
         log(executor.report())

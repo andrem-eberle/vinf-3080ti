@@ -115,20 +115,50 @@ class MtpDrafter:
             ex.mtp_forward(prompt[start + 1 : start + 1 + known], start)
 
     def draft(self, last_token: int, position: int, k: int) -> list[int]:
+        return self.draft_many([self._bound], [last_token], [k])[0]
+
+    def draft_many(self, seqs, last_tokens: list[int], ks: list[int]) -> list[list[int]]:
+        """Draft ks[i] tokens after last_tokens[i] for every sequence, one MTP pass per draft depth for all
+        of them (instead of one pass per sequence and depth)."""
         ex = self.ex
-        tokens = list(self.pending_tokens)
-        tokens[-1] = last_token
-        ex.mtp_load_hidden("spec_pend", self.row_base, len(tokens))
-        drafts = [ex.mtp_forward(tokens, self.pending_pos)]
-        last_row = len(tokens) - 1
-        pos = self.pending_pos + len(tokens)
+        h = ex.shapes.hidden
+        items, rows_of = [], []
+        for seq, last, k in zip(seqs, last_tokens, ks):
+            self.bind(seq)
+            if k < 1:
+                continue
+            tokens = list(self.pending_tokens)
+            tokens[-1] = last
+            rows_of.append((seq, self.row_base, self.pending_pos, tokens))
+        out = {id(seq): [] for seq in seqs}
+        if not rows_of:
+            return [[] for _ in seqs]
+        row = 0
+        for seq, base, pos, tokens in rows_of:
+            ex.rt.copy("mtp_hid", row * h, "spec_pend", base * h, len(tokens) * h)
+            row += len(tokens)
+        first = ex.mtp_forward_multi([(seq, pos, tokens) for seq, _, pos, tokens in rows_of])
+        need = {id(seq): k for seq, k in zip(seqs, ks)}
+        state, row = [], 0  # (seq, last row in mtp_out, next position)
+        for (seq, _, pos, tokens), d in zip(rows_of, first):
+            out[id(seq)].append(d)
+            row += len(tokens)
+            state.append((seq, row - 1, pos + len(tokens)))
         recur = "mtp_out" if self.draft_hidden == "post" else "mtp_h"
-        while len(drafts) < k:
-            ex.mtp_load_hidden(recur, last_row, 1)
-            drafts.append(ex.mtp_forward([drafts[-1]], pos))
-            last_row = 0
-            pos += 1
-        return drafts
+        depth = 1
+        while True:
+            active = [(seq, r, pos) for seq, r, pos in state if need[id(seq)] > depth]
+            if not active:
+                break
+            for j, (_, r, _) in enumerate(active):
+                ex.rt.copy("mtp_hid", j * h, recur, r * h, h)
+            drafts = ex.mtp_forward_multi([(seq, pos, [out[id(seq)][-1]]) for seq, _, pos in active])
+            state = []
+            for j, ((seq, _, pos), d) in enumerate(zip(active, drafts)):
+                out[id(seq)].append(d)
+                state.append((seq, j, pos + 1))
+            depth += 1
+        return [out[id(seq)] for seq in seqs]
 
     def observe_verify(self, position: int, keep: int, emitted: list[int], src_row: int = 0) -> None:
         """src_row: the sequence's first row in the verification pass (multi-sequence passes)."""

@@ -188,7 +188,16 @@ the newest request is
 swapped to host RAM and resumes later. Each request's output is identical to running it alone.
 
 Total throughput with concurrent requests (Qwen3.8-27B UD-Q3_K_XL, `--max-context 32768`, 100 new tokens each,
-including prompt processing): 1 request 8.6 tok/s, 2 requests 13.2 tok/s, 4 requests 18.1 tok/s.
+including prompt processing):
+
+| `--max-seqs` | Requests at once | Total tok/s |
+|---:|---:|---:|
+| 4 | 1 / 2 / 4 | 8.6 / 13.2 / 18.1 |
+| 16 (`--ssm-dtype f16`) | 1 / 8 / 16 | 6.2 / 30.1 / 39.3 |
+
+More slots hold more per-sequence state in VRAM (fewer weights on the GPU), which slows a lone request; pick
+`--max-seqs` for the expected number of agents. `--ssm-dtype f16` halves the SSM state per sequence (~80 MB instead
+of ~150 MB). With many sequences, drafts per sequence shrink so a verification pass stays within `--verify-rows`.
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d '{

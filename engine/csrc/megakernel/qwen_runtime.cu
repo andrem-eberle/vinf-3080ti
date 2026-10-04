@@ -425,10 +425,12 @@ __global__ void conv_update_kernel(const float *x, float *state, const float *w,
 // per token the block needs three barriers (q/k norms, k.S reduction, q.S reduction).
 constexpr int kGdP = 4;
 
-template <int R>
+// ST: state storage type. fp16 state is widened into fp32 registers for the whole pass and rounded once
+// when written back.
+template <int R, typename ST = float>
 __global__ void __launch_bounds__(32 * kGdP) gated_delta_reg_kernel(
     const float *conv_out, const float *beta_raw, const float *alpha_raw, const float *ssm_a, const float *dt_bias,
-    float *state, float *out, int key_heads, int value_heads, int vd, float eps, int head_order, int ntok, float *snap,
+    ST *state, float *out, int key_heads, int value_heads, int vd, float eps, int head_order, int ntok, float *snap,
     int write_state) {
     constexpr int kd = R * kGdP;
     __shared__ float qraw[kd], kraw[kd];
@@ -437,10 +439,10 @@ __global__ void __launch_bounds__(32 * kGdP) gated_delta_reg_kernel(
     const int j = blockIdx.y * 32 + lane;
     const int kh = head_order == 0 ? h / (value_heads / key_heads) : h % key_heads;
     const int conv_dim = 2 * key_heads * kd + value_heads * vd;
-    float *S = state + static_cast<size_t>(h) * kd * vd;
+    ST *S = state + static_cast<size_t>(h) * kd * vd;
     float st[R];
 #pragma unroll
-    for (int r = 0; r < R; ++r) st[r] = S[static_cast<size_t>(p * R + r) * vd + j];
+    for (int r = 0; r < R; ++r) st[r] = kv_load(S + static_cast<size_t>(p * R + r) * vd + j);
     const float a_h = ssm_a[h], dt_h = dt_bias[h];
     for (int t = 0; t < ntok; ++t) {
         const float *row = conv_out + static_cast<size_t>(t) * conv_dim;
@@ -504,7 +506,7 @@ __global__ void __launch_bounds__(32 * kGdP) gated_delta_reg_kernel(
     }
     if (write_state) {
 #pragma unroll
-        for (int r = 0; r < R; ++r) S[static_cast<size_t>(p * R + r) * vd + j] = st[r];
+        for (int r = 0; r < R; ++r) kv_store(S + static_cast<size_t>(p * R + r) * vd + j, st[r]);
     }
 }
 
@@ -566,7 +568,7 @@ __global__ void gated_delta_kernel(const float *conv_out, const float *beta_raw,
 
 constexpr int kRowsPerBlock = 8;
 constexpr int kMaxTokens = 8;
-constexpr int kMaxArgmaxRows = 64;
+constexpr int kMaxArgmaxRows = 256;
 
 // One warp per row; lanes stride over 8-element chunks so neighbouring lanes read
 // neighbouring weight bytes. Each dequantized chunk is applied to NT activation rows
@@ -1727,6 +1729,21 @@ void launch_gated_delta(const float *conv, const float *b, const float *a, const
                                                                          value_heads, kd, vd, eps, head_order, ntok, snap);
 }
 
+// fp16 state: register kernel only (head dims kd in {32, 64, 128, 256}, vd a multiple of 32).
+bool launch_gated_delta_h(const float *conv, const float *b, const float *a, const float *ssm_a, const float *dt, __half *st,
+                          float *o, int key_heads, int value_heads, int kd, int vd, float eps, int head_order, int ntok,
+                          int write_state) {
+    if (vd % 32 != 0) return false;
+    const dim3 grid(value_heads, vd / 32);
+    switch (kd) {
+        case 32: gated_delta_reg_kernel<8, __half><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, nullptr, write_state); return true;
+        case 64: gated_delta_reg_kernel<16, __half><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, nullptr, write_state); return true;
+        case 128: gated_delta_reg_kernel<32, __half><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, nullptr, write_state); return true;
+        case 256: gated_delta_reg_kernel<64, __half><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, nullptr, write_state); return true;
+        default: return false;
+    }
+}
+
 PyObject *Runtime_gated_delta(RuntimeObject *self, PyObject *args) {
     const char *cname, *bname, *aname, *ssm_a_name, *dt_name, *sname, *oname, *snapname = nullptr;
     int key_heads = 0, value_heads = 0, kd = 0, vd = 0, head_order = 0, ntok = 1;
@@ -2117,12 +2134,27 @@ PyObject *Runtime_gated_delta_seg(RuntimeObject *self, PyObject *args) {
     const float *conv = find_buffer(self, cname, conv_dim * ntok);
     const float *b = conv ? find_buffer(self, bname, static_cast<size_t>(value_heads) * ntok) : nullptr;
     const float *a = b ? find_buffer(self, aname, static_cast<size_t>(value_heads) * ntok) : nullptr;
-    float *st = a ? find_buffer(self, sname, state_n * self->max_slots) : nullptr;
-    float *o = st ? find_buffer(self, oname, static_cast<size_t>(value_heads) * vd * ntok) : nullptr;
+    int st_elem = 4;
+    void *st_raw = a ? find_kv_buffer(self, sname, state_n * self->max_slots, &st_elem) : nullptr;
+    float *o = st_raw ? find_buffer(self, oname, static_cast<size_t>(value_heads) * vd * ntok) : nullptr;
     const float *ssm_a = o ? find_f32_weight(self, ssm_a_name, value_heads) : nullptr;
     const float *dt = ssm_a ? find_f32_weight(self, dt_name, value_heads) : nullptr;
     if (dt == nullptr) return nullptr;
     const auto &g = *self->seg;
+    if (st_elem == 2) {  // fp16 SSM state
+        if (snapname != nullptr) return PyErr_Format(PyExc_ValueError, "fp16 SSM state does not support snapshots");
+        __half *sth = static_cast<__half *>(st_raw);
+        for (size_t i = 0; i < g.size(); i += 4) {
+            const int slot = g[i], rows = g[i + 2], row0 = g[i + 3];
+            if (!launch_gated_delta_h(conv + row0 * conv_dim, b + static_cast<size_t>(row0) * value_heads,
+                                      a + static_cast<size_t>(row0) * value_heads, ssm_a, dt, sth + slot * state_n,
+                                      o + static_cast<size_t>(row0) * value_heads * vd, key_heads, value_heads, kd, vd,
+                                      eps, head_order, rows, write_state))
+                return PyErr_Format(PyExc_ValueError, "fp16 SSM state needs key_head_dim in {32,64,128,256} and value_head_dim %% 32 == 0");
+        }
+        return launch_result("gated_delta_seg");
+    }
+    float *st = static_cast<float *>(st_raw);
     float *snap = nullptr;
     if (snapname != nullptr) {
         if (g.size() != 4) return PyErr_Format(PyExc_ValueError, "snapshots need a single-segment pass");
@@ -2138,6 +2170,27 @@ PyObject *Runtime_gated_delta_seg(RuntimeObject *self, PyObject *args) {
                            head_order, rows, snap, write_state, self->scratch_x);
     }
     return launch_result("gated_delta_seg");
+}
+
+__global__ void concat_rows_kernel(float *dst, const float *a, const float *b, int rows, int width) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<size_t>(rows) * 2 * width) return;
+    const size_t r = i / (2 * width), c = i % (2 * width);
+    dst[i] = c < static_cast<size_t>(width) ? a[r * width + c] : b[r * width + c - width];
+}
+
+// concat_rows(dst, a, b, rows, width): dst[r] = [a[r] | b[r]].
+PyObject *Runtime_concat_rows(RuntimeObject *self, PyObject *args) {
+    const char *dn, *an, *bn;
+    int rows = 0, width = 0;
+    if (!PyArg_ParseTuple(args, "sssii", &dn, &an, &bn, &rows, &width)) return nullptr;
+    const size_t n = static_cast<size_t>(rows) * width;
+    const float *a = find_buffer(self, an, n);
+    const float *b = a ? find_buffer(self, bn, n) : nullptr;
+    float *d = b ? find_buffer(self, dn, 2 * n) : nullptr;
+    if (d == nullptr) return nullptr;
+    concat_rows_kernel<<<blocks_for(2 * n, 256), 256>>>(d, a, b, rows, width);
+    return launch_result("concat_rows");
 }
 
 // zero_range(name, offset, n): clear n elements from offset.
@@ -2168,6 +2221,7 @@ PyMethodDef Runtime_methods[] = {
     {"gated_delta_seg", reinterpret_cast<PyCFunction>(Runtime_gated_delta_seg), METH_VARARGS,
      "gated_delta_seg(conv, beta, alpha, ssm_a, dt_bias, state, out, kh, vh, kd, vd, eps, head_order[, snap])."},
     {"zero_range", reinterpret_cast<PyCFunction>(Runtime_zero_range), METH_VARARGS, "zero_range(name, offset, n)."},
+    {"concat_rows", reinterpret_cast<PyCFunction>(Runtime_concat_rows), METH_VARARGS, "concat_rows(dst, a, b, rows, width)."},
     {"buffer_elem", reinterpret_cast<PyCFunction>(Runtime_buffer_elem), METH_VARARGS,
      "buffer_elem(name) -> bytes per element (4 = fp32, 2 = fp16)."},
     {"set_gemm_min_rows", reinterpret_cast<PyCFunction>(Runtime_set_gemm_min_rows), METH_VARARGS,

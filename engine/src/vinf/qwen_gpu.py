@@ -63,6 +63,8 @@ MLP_QMV = ("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight")
 HEAD_ORDERS = {"grouped": 0, "tiled": 1}
 # Must match kMaxTokens in csrc/megakernel/qwen_runtime.cu.
 MAX_BATCH = 8
+# Concurrent sequences per executor (kMaxArgmaxRows in the runtime bounds the rows of one LM-head pass).
+MAX_SEQS = 64
 
 
 class KvPoolExhausted(InsufficientMemoryError):
@@ -210,6 +212,9 @@ class QwenGpuExecutor:
         max_seqs: int = 1,
         kv_pool_tokens: int | None = None,
         page_size: int = 256,
+        ssm_dtype: str = "f32",
+        verify_rows: int = 64,
+        batch_kernels: bool | None = None,
         snapshot_tokens: int = 0,
         mtp: bool = False,
         placement: str = "hybrid",
@@ -223,8 +228,10 @@ class QwenGpuExecutor:
             raise ConfigurationError("placement must be 'hybrid' (CPU computes layers that do not fit) or 'stream'")
         if not 1 <= max_batch <= MAX_BATCH:
             raise ConfigurationError(f"max_batch must be in [1, {MAX_BATCH}]")
-        if not 1 <= max_seqs <= MAX_BATCH:
-            raise ConfigurationError(f"max_seqs must be in [1, {MAX_BATCH}]")
+        if not 1 <= max_seqs <= MAX_SEQS:
+            raise ConfigurationError(f"max_seqs must be in [1, {MAX_SEQS}]")
+        if ssm_dtype not in ("f16", "f32"):
+            raise ConfigurationError("ssm_dtype must be 'f16' or 'f32'")
         if kv_dtype not in ("f16", "f32"):
             raise ConfigurationError("kv_dtype must be 'f16' or 'f32'")
         if prefill_batch < 1:
@@ -262,8 +269,15 @@ class QwenGpuExecutor:
         pool = max_context if kv_pool_tokens is None else max(kv_pool_tokens, self.page_size)
         self.kv_pages = -(-pool // self.page_size)
         self.reclaim = None  # optional callback(pages_needed) -> bool that frees idle sequences
-        # Rows of a verification pass: every sequence's next input plus its drafts.
-        self.verify_rows = max(max_batch, max_seqs * snapshot_tokens)
+        # Rows of a verification pass: every sequence's next input plus its drafts (capped; with many
+        # sequences the scheduler drafts fewer tokens per sequence).
+        self.verify_rows = max(max_batch, max_seqs, min(verify_rows, max_seqs * snapshot_tokens))
+        # SSM recurrent state precision on the GPU (fp16 halves the per-sequence state; math stays fp32).
+        self.ssm_dtype = ssm_dtype
+        # Several sequences: every pass uses the prompt kernels (tensor-core GEMM, tiled attention), whose
+        # per-row results do not depend on how many rows share the pass, so a sequence's output does not
+        # depend on its neighbours and large batches stay cheap.
+        self.batch_kernels = max_seqs > 1 if batch_kernels is None else batch_kernels
         # Rows per prompt-processing pass: each streamed weight crosses PCIe once per pass, so wide passes
         # make prefill compute-bound instead of PCIe-bound. DFlash feature capture keeps max_batch rows.
         self.prefill_batch = max(max_batch, prefill_batch) if not capture_layers else max_batch
@@ -326,6 +340,7 @@ class QwenGpuExecutor:
         self.kv_dtype = "f16"
         self.max_seqs, self.page_size, self.pages_per_seq = 1, max_context, 1
         self.kv_pages, self.verify_rows = 1, 8
+        self.ssm_dtype, self.batch_kernels = "f32", False
         self.mtp_layer = None
         self.placement, self.cpu_layers, self.cpu = "stream", frozenset(), None
         self.capture_layers, self.reserve_extra_bytes = (), 0
@@ -420,14 +435,14 @@ class QwenGpuExecutor:
         specs["logits"] = s.vocab * self.verify_rows  # LM head rows: verification / multi-sequence passes only
         if "spec_pend" in specs:  # MTP rows pending per sequence slot
             specs["spec_pend"] = s.hidden * self.max_batch * self.max_seqs
+            specs["mtp_last"] = s.hidden * self.max_seqs
         specs["page_table"] = self.max_seqs * self.pages_per_seq
         if self.snapshot_tokens > 0:
-            # Inputs of the SSM layers in a verification pass (conv input, conv output, beta, alpha rows):
+            # Inputs of the SSM layers in a verification pass (conv input, beta, alpha rows):
             # rollback replays the accepted rows from the untouched state.
             for i, kind in enumerate(self.schedule):
                 if kind is QwenLayerKind.LINEAR_ATTENTION:
                     specs[f"hq.{i}"] = s.conv_dim * self.verify_rows
-                    specs[f"hc.{i}"] = s.conv_dim * self.verify_rows
                     specs[f"hb.{i}"] = s.value_heads * self.verify_rows
                     specs[f"ha.{i}"] = s.value_heads * self.verify_rows
         specs["h_last"] = s.hidden
@@ -459,7 +474,11 @@ class QwenGpuExecutor:
 
     def _state_elem(self, name: str) -> int:
         """Bytes per element of a GPU state buffer (fp16 attention KV caches)."""
-        return 2 if self.kv_dtype == "f16" and name.startswith(("kc.", "vc.")) else 4
+        if name.startswith(("kc.", "vc.")):
+            return 2 if self.kv_dtype == "f16" else 4
+        if name.startswith("ssm."):
+            return 2 if self.ssm_dtype == "f16" else 4
+        return 4
 
     def _layer_of(self, name: str) -> int | None:
         return int(name.split(".")[1]) if name.split(".")[1].isdigit() else None
@@ -501,7 +520,7 @@ class QwenGpuExecutor:
             free_vram_bytes = self.rt.mem_info()[0]
         states = self._gpu_state_specs()
         kv = sum(n * self._state_elem(name) for name, n in states.items() if name.startswith(("kc.", "vc.")))
-        ssm = sum(n for name, n in states.items() if name.startswith(("conv", "ssm"))) * 4
+        ssm = sum(n * self._state_elem(name) for name, n in states.items() if name.startswith(("conv", "ssm")))
         # + kernel/runtime slack + memory reserved for an external drafter (e.g. DFlash weights)
         activations = sum(self._buffer_specs().values()) * 4 + 32 * 1024**2 + self.reserve_extra_bytes
         gpu_layers = [i for i in range(len(self.schedule)) if i not in self.cpu_layers]
@@ -554,6 +573,10 @@ class QwenGpuExecutor:
         self.rt.set_stream_order(order, self.stream_slots)
 
     def _alloc_buffers(self) -> None:
+        if self.ssm_dtype == "f16" and QwenLayerKind.LINEAR_ATTENTION in self.schedule:
+            s = self.shapes
+            if s.key_head_dim not in (32, 64, 128, 256) or s.value_head_dim % 32:
+                raise ConfigurationError("fp16 SSM state needs key_head_dim in {32, 64, 128, 256} and value_head_dim % 32 == 0")
         for name, n in self._buffer_specs().items():
             self.rt.alloc(name, n)
         for name, n in self._gpu_state_specs().items():
@@ -565,6 +588,13 @@ class QwenGpuExecutor:
             for name, n in {**self._buffer_specs(), **self._cpu_state_specs()}.items():
                 self.cpu.alloc(name, n)
         self.rt.set_paging("page_table", self.page_size, self.pages_per_seq, self.max_seqs)
+        self.prompt_mode(False)
+
+    def prompt_mode(self, on: bool) -> None:
+        """Prompt passes use the tensor-core GEMM and tiled attention; with several sequences every pass does."""
+        gemm = getattr(self.rt, "set_gemm_min_rows", None)
+        if gemm is not None:
+            gemm(1 if on or self.batch_kernels else 0)
 
     # ---- sequences ------------------------------------------------------------------------------
 
@@ -716,7 +746,6 @@ class QwenGpuExecutor:
                                s.conv_kernel, None, 0)
             rt.gated_delta_seg(*gd, None, 0)
             rt.copy(f"hq.{layer_idx}", 0, "lin_qkv", 0, n * s.conv_dim)
-            rt.copy(f"hc.{layer_idx}", 0, "lin_conv", 0, n * s.conv_dim)
             rt.copy(f"hb.{layer_idx}", 0, "lin_beta", 0, n * s.value_heads)
             rt.copy(f"ha.{layer_idx}", 0, "lin_alpha", 0, n * s.value_heads)
         elif rt is self.rt:  # state slot per segment
@@ -805,7 +834,7 @@ class QwenGpuExecutor:
                 p = f"blk.{i}."
                 self.rt.conv_update_seg(f"hq.{i}", f"conv.{i}", p + "ssm_conv1d.weight", "lin_conv", s.conv_dim,
                                         s.conv_kernel)
-                self.rt.gated_delta_seg(f"hc.{i}", f"hb.{i}", f"ha.{i}", p + "ssm_a", p + "ssm_dt.bias", f"ssm.{i}",
+                self.rt.gated_delta_seg("lin_conv", f"hb.{i}", f"ha.{i}", p + "ssm_a", p + "ssm_dt.bias", f"ssm.{i}",
                                         "lin_core", s.key_heads, s.value_heads, s.key_head_dim, s.value_head_dim,
                                         s.eps, self.head_order)
         if self.cpu_layers:  # single sequence: restore the CPU layers' snapshots
@@ -825,8 +854,8 @@ class QwenGpuExecutor:
         """One pass over one new token for each sequence (reading every weight once for all of them).
         Row r of the pass belongs to seqs[r]; follow with greedy_rows() for each sequence's next token."""
         n = len(seqs)
-        if not 1 <= n <= self.max_batch or len(token_ids) != n:
-            raise ConfigurationError(f"multi-sequence pass needs 1..{self.max_batch} sequences, one token each")
+        if not 1 <= n <= self.verify_rows or len(token_ids) != n:
+            raise ConfigurationError(f"multi-sequence pass needs 1..{self.verify_rows} sequences, one token each")
         if self.cpu_layers and n > 1:
             raise ConfigurationError("CPU layers run a single sequence")
         for seq in seqs:
@@ -927,33 +956,46 @@ class QwenGpuExecutor:
         self.rt.copy("mtp_hid", dst_row * h, src, src_row * h, n * h)
 
     def mtp_forward(self, next_tokens: list[int], position: int) -> int:
-        """Run the MTP block over n rows at positions [position, position + n). Row t combines the
-        embedding of next_tokens[t] with hidden row t of "mtp_hid" (post-norm target hidden of
-        position + t, or the previous MTP output when drafting recursively). Post-norm outputs land
-        in "mtp_out"; returns the greedy draft from the last row."""
+        """Run the MTP block over n rows of the active sequence at positions [position, position + n). Row t
+        combines the embedding of next_tokens[t] with hidden row t of "mtp_hid" (post-norm target hidden of
+        position + t, or the previous MTP output when drafting recursively). Post-norm outputs land in
+        "mtp_out"; returns the greedy draft from the last row."""
+        return self.mtp_forward_multi([(self.seq, position, list(next_tokens))])[0]
+
+    def mtp_forward_multi(self, items: list[tuple]) -> list[int]:
+        """MTP block over several sequences in one pass: items = [(sequence, position, next_tokens)], whose
+        hidden rows are stacked in "mtp_hid" in the same order. Returns each item's greedy draft (its last
+        row); post-norm outputs are stacked in "mtp_out"."""
         if self.mtp_layer is None:
             raise ConfigurationError("executor was created without mtp=True")
-        n = len(next_tokens)
-        if not 1 <= n <= self.prefill_batch or position + n > self.max_context:
-            raise ConfigurationError("invalid MTP batch or position")
+        n = sum(len(toks) for _, _, toks in items)
+        if not items or not 1 <= n <= self.prefill_batch or len(items) > self.max_seqs:
+            raise ConfigurationError("invalid MTP batch")
+        for seq, position, toks in items:
+            if not toks or position + len(toks) > self.max_context:
+                raise ConfigurationError("invalid MTP position")
+            self.ensure_pages(seq, position + len(toks))
         rt, s, p = self.rt, self.shapes, f"blk.{self.mtp_layer}."
         h = s.hidden
-        self.ensure_pages(self.seq, position + n)
-        rt.set_segments([(self.seq.slot, position, n)])
-        rows = load_qwen_token_embeddings(self.gguf, list(next_tokens))
+        rt.set_segments([(seq.slot, position, len(toks)) for seq, position, toks in items])
+        rows = load_qwen_token_embeddings(self.gguf, [t for _, _, toks in items for t in toks])
         rt.write("mtp_e", array("f", [v for row in rows for v in row]).tobytes())
-        e_half = 0 if self.mtp_concat == "eh" else 1
-        for src, norm, half in (("mtp_e", "nextn.enorm.weight", e_half), ("mtp_hid", "nextn.hnorm.weight", 1 - e_half)):
-            rt.rmsnorm(src, p + norm, "mtp_tmp", h, s.eps, n)
-            for t in range(n):
-                rt.copy("mtp_cat", (2 * t + half) * h, "mtp_tmp", t * h, h)
+        rt.rmsnorm("mtp_e", p + "nextn.enorm.weight", "mtp_tmp", h, s.eps, n)
+        rt.rmsnorm("mtp_hid", p + "nextn.hnorm.weight", "mtp_out", h, s.eps, n)  # mtp_out as scratch
+        if self.mtp_concat == "eh":
+            rt.concat_rows("mtp_cat", "mtp_tmp", "mtp_out", n, h)
+        else:
+            rt.concat_rows("mtp_cat", "mtp_out", "mtp_tmp", n, h)
         rt.qmv(p + "nextn.eh_proj.weight", "mtp_cat", "mtp_h", n)
-        self._full_attention(self.mtp_layer, position, n, h="mtp_h")
+        self._full_attention(self.mtp_layer, items[0][1], n, h="mtp_h")
         self._mlp(self.mtp_layer, n, h="mtp_h")
         rt.rmsnorm("mtp_h", p + "nextn.shared_head_norm.weight", "mtp_out", h, s.eps, n)
-        rt.copy("h_last", 0, "mtp_out", (n - 1) * h, h)
-        rt.qmv("output.weight", "h_last", "logits")
-        return rt.argmax("logits", s.vocab)
+        row = 0
+        for i, (_, _, toks) in enumerate(items):
+            row += len(toks)
+            rt.copy("mtp_last", i * h, "mtp_out", (row - 1) * h, h)
+        rt.qmv("output.weight", "mtp_last", "logits", len(items))
+        return rt.argmax_rows("logits", s.vocab, len(items))
 
     def prefill(self, prompt_tokens: list[int], *, start: int = 0, before_last=None, observe=None) -> None:
         """Forward prompt_tokens[start:] (positions [start, len)) in passes of prefill_batch rows.
@@ -965,9 +1007,7 @@ class QwenGpuExecutor:
                   for i in range(start, len(prompt_tokens), self.prefill_batch)]
         # Prompt passes use the tensor-core GEMM for every pass size, so the computed state does not
         # depend on where a prompt is split (prefix-cache resumes match a fresh prefill).
-        gemm = getattr(self.rt, "set_gemm_min_rows", None)
-        if gemm is not None:
-            gemm(1)
+        self.prompt_mode(True)
         try:
             for idx, (i, chunk) in enumerate(chunks):
                 if idx == len(chunks) - 1 and before_last is not None:
@@ -976,8 +1016,7 @@ class QwenGpuExecutor:
                 if observe is not None:
                     observe(i, chunk)
         finally:
-            if gemm is not None:
-                gemm(0)
+            self.prompt_mode(False)
 
     # ---- state save / restore (prefix cache) ----------------------------------------------------
 
@@ -996,7 +1035,7 @@ class QwenGpuExecutor:
 
     def recurrent_bytes(self) -> int:
         specs = self._state_specs()  # per sequence (the specs cover every slot)
-        return sum(specs[n] // self.max_seqs for n in self._recurrent_names()) * 4
+        return sum(specs[n] // self.max_seqs * self._state_elem(n) for n in self._recurrent_names())
 
     def save_recurrent(self) -> dict[str, bytes]:
         """Host copy of the active sequence's SSM/conv state (the part that cannot be rewound)."""

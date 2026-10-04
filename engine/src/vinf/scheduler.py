@@ -212,9 +212,7 @@ class Scheduler:
         t0 = time.perf_counter()
         if last and self.cache is not None:
             self.cache.checkpoint(full)
-        gemm = getattr(ex.rt, "set_gemm_min_rows", None) if prompt_mode else None
-        if gemm is not None:
-            gemm(1)
+        ex.prompt_mode(prompt_mode)
         try:
             self._with_pages(job, lambda: ex.forward_tokens(chunk))
             if self.decoder is not None:
@@ -223,8 +221,7 @@ class Scheduler:
             self._finish(job, error=exc)
             return
         finally:
-            if gemm is not None:
-                gemm(0)
+            ex.prompt_mode(False)
         self.passes += 1
         job.cursor = start + len(chunk)
         job.prompt_seconds += time.perf_counter() - t0
@@ -262,15 +259,13 @@ class Scheduler:
         """Draft for every sequence, verify all drafts in one pass, keep each sequence's accepted prefix."""
         ex, dec = self.ex, self.decoder
         drafter = dec.drafter
-        rows = []
-        for job in jobs:
-            seq = job.seq
-            ex.activate(seq)
-            drafter.bind(seq)
-            k = min(dec.k, ex.max_context - seq.position - 1, job.max_new - len(job.out) - 1)
-            drafts = drafter.draft(job.out[-1], seq.position, k) if k >= 1 else []
-            rows.append([job.out[-1]] + drafts)
+        # Drafts per sequence: fewer when many sequences share the pass (rows are capped by verify_rows;
+        # a full batch already amortizes the weight stream).
+        k_max = min(dec.k, ex.verify_rows // len(jobs) - 1)
+        ks = [max(0, min(k_max, ex.max_context - j.seq.position - 1, j.max_new - len(j.out) - 1)) for j in jobs]
         seqs = [j.seq for j in jobs]
+        drafts = drafter.draft_many(seqs, [j.out[-1] for j in jobs], ks)
+        rows = [[j.out[-1]] + d for j, d in zip(jobs, drafts)]
 
         def run():
             ex.forward_verify(seqs, rows)
