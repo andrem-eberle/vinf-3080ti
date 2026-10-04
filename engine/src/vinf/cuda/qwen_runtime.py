@@ -66,7 +66,7 @@ class CudaWeightRuntime:
         self._rt.free(name)
 
     def upload_gguf_tensor(
-        self, gguf: GGUFFile, name: str, *, device_name: str | None = None, resident: bool = True
+        self, gguf: GGUFFile, name: str, *, device_name: str | None = None, resident: bool = True, group: int = -1
     ) -> int:
         """Upload raw blocks; resident=False keeps them in pinned host memory, streamed on use."""
         tensor = gguf.tensors[name]
@@ -78,7 +78,7 @@ class CudaWeightRuntime:
             rows *= dim
         file_obj, mm, view = gguf.mmap_tensor(name)
         try:
-            self._rt.upload(device_name or name, view, int(tensor.tensor_type), cols, rows, resident)
+            self._rt.upload(device_name or name, view, int(tensor.tensor_type), cols, rows, resident, group)
         finally:
             view.release()
             mm.close()

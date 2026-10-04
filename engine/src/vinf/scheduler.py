@@ -110,6 +110,8 @@ class Scheduler:
                     self.lock.wait()
             try:
                 self._iteration()
+                if not self.running and not self.waiting and getattr(self.ex, "demoted", None):
+                    self._rebalance()
             except Exception as exc:  # noqa: BLE001 - fail the affected requests, keep serving
                 self.log(traceback.format_exc())
                 with self.lock:
@@ -130,6 +132,13 @@ class Scheduler:
                 self._spec_batch_step(decoding)
             else:
                 self._batch_step(decoding)
+
+    def _rebalance(self) -> None:
+        """Idle: give VRAM back to the weights (idle cached sequences are saved to host and evicted)."""
+        make_room = (lambda: self.cache.reclaim(0)) if self.cache is not None else None
+        n = self.ex.promote_layers(make_room)
+        if n:
+            self.log(f"idle: {n} weight layer(s) back in VRAM ({len(self.ex.demoted)} still streamed)")
 
     # ---- admission ----------------------------------------------------------------------------
 

@@ -41,6 +41,7 @@ def backend(test, *, speculative=0, cache=True, **kwargs):
     from vinf.qwen_backend import QwenBackend
 
     meta, gguf = fixture()
+    kwargs.setdefault("batch_kernels", True)  # batch-invariant kernels: outputs comparable with solo runs
     ex = executor_or_skip(test, gguf, meta, mtp=speculative > 0,
                           snapshot_tokens=speculative + 1 if speculative else 0, **kwargs)
     decoder = None
@@ -68,7 +69,7 @@ class MultiSequencePassTests(unittest.TestCase):
         ps = prompts(3)
         want = solo(self, ps, 10)
         meta, gguf = fixture()
-        ex = executor_or_skip(self, gguf, meta, max_seqs=3)
+        ex = executor_or_skip(self, gguf, meta, max_seqs=3, batch_kernels=True)
         seqs, outs = [], []
         for p in ps:
             seq = ex.seq if not seqs else ex.new_sequence()
@@ -209,3 +210,51 @@ class ConcurrentHttpTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SharedVramTests(unittest.TestCase):
+    """Dynamic memory: sequence state is mapped on use; weights are demoted to streaming under a VRAM budget
+    and promoted back when idle. Outputs must not change."""
+
+    def test_budget_forces_demotion_and_idle_promotes(self):
+        import time
+
+        ps = prompts(3, seed=41, lo=40, hi=90)
+        want = solo(self, ps, 12)
+        b = backend(self, speculative=3, max_seqs=3)
+        ex = b.base
+        self.assertTrue(ex.dynamic)
+        gran = ex.rt.vmm_granularity()
+        # The first KV pages map one granule per KV buffer (6 here); allow 4: two weight layers must go.
+        ex.vram_budget = ex.used_vram() + 4 * gran
+        sched = b.scheduler(log=lambda m: None)
+        jobs = [sched.submit(p, 12) for p in ps]
+        for job in jobs:
+            for _ in job:
+                pass
+        for job, w in zip(jobs, want):
+            stop = next((i for i, t in enumerate(w) if t in b.stop_token_ids), None)
+            self.assertEqual(job.out, w[: stop + 1 if stop is not None else 12])
+        self.assertTrue(ex.demoted or b.prefix_cache.stats.evictions)  # the budget had to give
+        demoted_peak = len(ex.demoted)
+        ex.vram_budget = ex.used_vram() + 64 * gran  # plenty again: idle promotion brings weights back
+        deadline = time.time() + 10
+        while ex.demoted and time.time() < deadline:
+            sched.submit([5, 6, 7], 1)
+            time.sleep(0.2)
+        self.assertEqual(ex.demoted, [], f"still demoted after idle (peak {demoted_peak})")
+
+    def test_state_is_mapped_only_while_used(self):
+        meta, gguf = fixture()
+        ex = executor_or_skip(self, gguf, meta, max_seqs=8)
+        base = ex.rt.buffer_bytes()
+        seqs = [ex.new_sequence() for _ in range(5)]
+        for s in seqs:
+            ex.activate(s)
+            ex.reset()
+            ex.prefill(prompts(1, seed=s.slot)[0])
+        grown = ex.rt.buffer_bytes()
+        self.assertGreater(grown, base)
+        for s in seqs:
+            ex.release_sequence(s)
+        self.assertEqual(ex.rt.buffer_bytes(), base)

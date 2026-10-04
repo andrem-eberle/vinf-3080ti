@@ -12,10 +12,12 @@
 //   Output ownership: lane 0 of the owning warp writes y[row].
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -877,6 +879,9 @@ struct DeviceTensor {
     uint8_t *data = nullptr;  // device pointer when resident, pinned host pointer when streamed
     bool resident = true;
     bool in_arena = false;  // carved from the weight arena (freed with it)
+    int group = -1;           // weight group (VMM region) for tensors that can be demoted / promoted
+    uint8_t *dev = nullptr;   // address inside the group region
+    uint8_t *host = nullptr;  // pinned host copy (made on first demotion)
     int type = 0;
     int rows = 0;
     int cols = 0;
@@ -884,21 +889,149 @@ struct DeviceTensor {
     size_t nbytes = 0;
 };
 
+// Virtual buffer (CUDA VMM): address space reserved up front, physical memory mapped per granule on
+// demand (map_range / unmap_range), refcounted so ranges sharing a granule keep it mapped.
+struct VirtualSpace {
+    CUdeviceptr base = 0;
+    size_t va_bytes = 0;
+    size_t gran = 0;
+    std::vector<CUmemGenericAllocationHandle> handle;  // per granule; 0 = unmapped
+    std::vector<int> refs;
+    size_t mapped = 0;  // physical bytes mapped
+};
+
 struct DeviceBuffer {
     float *data = nullptr;
     size_t n = 0;     // elements
     int elem = 4;     // bytes per element: 4 (fp32) or 2 (fp16 KV caches)
+    VirtualSpace *vs = nullptr;  // non-null: virtual buffer (only mapped ranges may be touched)
     size_t bytes() const { return n * static_cast<size_t>(elem); }
+    size_t resident_bytes() const { return vs != nullptr ? vs->mapped : bytes(); }
 };
+
+static CUmemAllocationProp vmm_prop() {
+    CUmemAllocationProp prop{};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    prop.location.id = dev;
+    return prop;
+}
+
+static size_t vmm_granularity() {
+    static size_t gran = 0;
+    if (gran == 0) {
+        CUmemAllocationProp prop = vmm_prop();
+        if (cuMemGetAllocationGranularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS) gran = 2u << 20;
+    }
+    return gran;
+}
+
+static bool vmm_reserve(VirtualSpace &v, size_t bytes) {
+    cudaFree(nullptr);  // make sure the primary context is current for the driver API
+    v.gran = vmm_granularity();
+    v.va_bytes = (bytes + v.gran - 1) / v.gran * v.gran;
+    if (cuMemAddressReserve(&v.base, v.va_bytes, 0, 0, 0) != CUDA_SUCCESS) return false;
+    v.handle.assign(v.va_bytes / v.gran, 0);
+    v.refs.assign(v.va_bytes / v.gran, 0);
+    return true;
+}
+
+// Map granules covering [off, off + len) bytes; returns false (nothing changed) when out of memory.
+static bool vmm_map(VirtualSpace &v, size_t off, size_t len) {
+    if (len == 0) return true;
+    const size_t g0 = off / v.gran, g1 = (off + len - 1) / v.gran;
+    CUmemAllocationProp prop = vmm_prop();
+    CUmemAccessDesc access{};
+    access.location = prop.location;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    std::vector<size_t> fresh;
+    for (size_t g = g0; g <= g1; ++g) {
+        if (v.refs[g] == 0) {
+            CUmemGenericAllocationHandle h = 0;
+            bool ok = cuMemCreate(&h, v.gran, &prop, 0) == CUDA_SUCCESS;
+            if (ok && cuMemMap(v.base + g * v.gran, v.gran, 0, h, 0) != CUDA_SUCCESS) {
+                cuMemRelease(h);
+                ok = false;
+            }
+            if (ok && cuMemSetAccess(v.base + g * v.gran, v.gran, &access, 1) != CUDA_SUCCESS) {
+                cuMemUnmap(v.base + g * v.gran, v.gran);
+                cuMemRelease(h);
+                ok = false;
+            }
+            if (!ok) {  // roll back this call's fresh granules
+                for (size_t f : fresh) {
+                    cuMemUnmap(v.base + f * v.gran, v.gran);
+                    cuMemRelease(v.handle[f]);
+                    v.handle[f] = 0;
+                    v.mapped -= v.gran;
+                }
+                for (size_t r = g0; r < g; ++r)
+                    if (std::find(fresh.begin(), fresh.end(), r) == fresh.end()) --v.refs[r];
+                for (size_t f : fresh) v.refs[f] = 0;
+                return false;
+            }
+            v.handle[g] = h;
+            v.mapped += v.gran;
+            fresh.push_back(g);
+        }
+        ++v.refs[g];
+    }
+    return true;
+}
+
+static void vmm_unmap(VirtualSpace &v, size_t off, size_t len) {
+    if (len == 0) return;
+    const size_t g0 = off / v.gran, g1 = (off + len - 1) / v.gran;
+    bool synced = false;
+    for (size_t g = g0; g <= g1; ++g) {
+        if (v.refs[g] <= 0) continue;
+        if (--v.refs[g] == 0) {
+            if (!synced) {
+                cudaDeviceSynchronize();  // no kernel may still use the memory
+                synced = true;
+            }
+            cuMemUnmap(v.base + g * v.gran, v.gran);
+            cuMemRelease(v.handle[g]);
+            v.handle[g] = 0;
+            v.mapped -= v.gran;
+        }
+    }
+}
+
+static void vmm_free(VirtualSpace &v) {
+    if (v.base == 0) return;
+    cudaDeviceSynchronize();
+    for (size_t g = 0; g < v.handle.size(); ++g) {
+        if (v.handle[g] != 0) {
+            cuMemUnmap(v.base + g * v.gran, v.gran);
+            cuMemRelease(v.handle[g]);
+        }
+    }
+    cuMemAddressFree(v.base, v.va_bytes);
+    v = VirtualSpace();
+}
 
 // Prefetch ring for streamed tensors. Streamed weights are used in a fixed cyclic order
 // (the decode op sequence), so item s of the sequence lives in slot s % K. The copy stream
 // (non-blocking) fills a slot once the kernel that last read it has finished; each matvec
 // waits only for its own slot's copy. Out-of-order use resynchronizes the ring.
+static void release_buffer(DeviceBuffer &b) {
+    if (b.vs != nullptr) {
+        vmm_free(*b.vs);
+        delete b.vs;
+        b.vs = nullptr;
+    } else {
+        cudaFree(b.data);
+    }
+    b.data = nullptr;
+}
+
 struct StreamRing {
     std::vector<std::string> order;
     std::unordered_map<std::string, int> index;
-    std::vector<uint8_t *> slots;
+    std::vector<uint8_t *> slots;  // borrowed from the runtime's persistent slot pool (not freed here)
     std::vector<cudaEvent_t> ready;
     std::vector<cudaEvent_t> free_ev;
     size_t slot_bytes = 0;
@@ -913,7 +1046,6 @@ struct StreamRing {
 
     void destroy() {
         if (copy != nullptr) cudaStreamSynchronize(copy);
-        for (auto *p : slots) cudaFree(p);
         for (auto e : ready) cudaEventDestroy(e);
         for (auto e : free_ev) cudaEventDestroy(e);
         if (copy != nullptr) cudaStreamDestroy(copy);
@@ -924,9 +1056,23 @@ struct StreamRing {
     }
 };
 
+// A weight group: a granule-aligned region of the weight space holding one layer's resident tensors.
+// Demoting it copies the tensors to pinned host memory (they stream from there) and unmaps the region.
+struct WeightGroup {
+    size_t off = 0, bytes = 0, used = 0;
+    bool mapped = false;
+    std::vector<std::string> tensors;
+};
+
 struct RuntimeObject {
     PyObject_HEAD
     StreamRing *ring;
+    VirtualSpace *wspace;
+    std::vector<WeightGroup> *groups;
+    // Persistent stream-ring slot buffers: reused across stream-order changes (weight demotion and
+    // promotion) so changing the streamed set never needs new device memory.
+    std::vector<uint8_t *> *ring_pool;
+    size_t ring_pool_bytes;
     std::unordered_map<std::string, DeviceTensor> *tensors;
     std::unordered_map<std::string, DeviceBuffer> *buffers;
     uint8_t *staging;
@@ -973,7 +1119,10 @@ bool ensure_scratch(RuntimeObject *self, size_t x_len, size_t y_len) {
 }
 
 void free_tensor(DeviceTensor &t) {
-    if (t.in_arena) {
+    if (t.group >= 0) {
+        if (t.host != nullptr) cudaFreeHost(t.host);
+        t.host = nullptr;
+    } else if (t.in_arena) {
         // Arena space is reclaimed only when the arena is reset.
     } else if (t.resident) {
         cudaFree(t.data);
@@ -1154,7 +1303,7 @@ void Runtime_dealloc(RuntimeObject *self) {
         self->tensors = nullptr;
     }
     if (self->buffers != nullptr) {
-        for (auto &item : *self->buffers) cudaFree(item.second.data);
+        for (auto &item : *self->buffers) release_buffer(item.second);
         delete self->buffers;
         self->buffers = nullptr;
     }
@@ -1169,6 +1318,18 @@ void Runtime_dealloc(RuntimeObject *self) {
     cudaFree(self->scratch_x);
     cudaFree(self->scratch_y);
     cudaFree(self->gemm_x);
+    if (self->wspace != nullptr) {
+        vmm_free(*self->wspace);
+        delete self->wspace;
+        self->wspace = nullptr;
+    }
+    delete self->groups;
+    self->groups = nullptr;
+    if (self->ring_pool != nullptr) {
+        for (auto *q : *self->ring_pool) cudaFree(q);
+        delete self->ring_pool;
+        self->ring_pool = nullptr;
+    }
     delete self->seg;
     self->seg = nullptr;
     Py_TYPE(self)->tp_free(reinterpret_cast<PyObject *>(self));
@@ -1177,8 +1338,8 @@ void Runtime_dealloc(RuntimeObject *self) {
 PyObject *Runtime_upload(RuntimeObject *self, PyObject *args) {
     const char *name = nullptr;
     Py_buffer data;
-    int type = 0, cols = 0, rows = 0, resident = 1;
-    if (!PyArg_ParseTuple(args, "sy*iii|p", &name, &data, &type, &cols, &rows, &resident)) return nullptr;
+    int type = 0, cols = 0, rows = 0, resident = 1, group = -1;
+    if (!PyArg_ParseTuple(args, "sy*iii|pi", &name, &data, &type, &cols, &rows, &resident, &group)) return nullptr;
     TypeTraits t;
     if (!type_traits(type, &t)) {
         PyBuffer_Release(&data);
@@ -1204,7 +1365,23 @@ PyObject *Runtime_upload(RuntimeObject *self, PyObject *args) {
     cudaError_t err;
     // +16: the megakernel's aligned 16-byte row loads may read up to 15 bytes past the end.
     const size_t padded = (nbytes + 16 + 255) / 256 * 256;
-    if (dt.resident && self->arena != nullptr && self->arena_used + padded <= self->arena_bytes) {
+    if (dt.resident && group >= 0) {
+        if (self->groups == nullptr || group >= static_cast<int>(self->groups->size())) {
+            PyBuffer_Release(&data);
+            return PyErr_Format(PyExc_ValueError, "unknown weight group %d", group);
+        }
+        WeightGroup &g = (*self->groups)[group];
+        if (!g.mapped || g.used + padded > g.bytes) {
+            PyBuffer_Release(&data);
+            return PyErr_Format(PyExc_ValueError, "weight group %d has no room for %s", group, name);
+        }
+        dt.dev = reinterpret_cast<uint8_t *>(self->wspace->base) + g.off + g.used;
+        dt.data = dt.dev;
+        dt.group = group;
+        g.used += padded;
+        g.tensors.push_back(name);
+        err = cudaMemcpy(dt.data, data.buf, nbytes, cudaMemcpyHostToDevice);
+    } else if (dt.resident && self->arena != nullptr && self->arena_used + padded <= self->arena_bytes) {
         dt.data = self->arena + self->arena_used;
         dt.in_arena = true;
         self->arena_used += padded;
@@ -1251,6 +1428,20 @@ PyObject *Runtime_has(RuntimeObject *self, PyObject *args) {
 PyObject *Runtime_device_bytes(RuntimeObject *self, PyObject *) {
     size_t total = 0;
     for (auto &item : *self->tensors) if (item.second.resident) total += item.second.nbytes;
+    return PyLong_FromSize_t(total);
+}
+
+// vram_bytes(): device memory this runtime holds: weight arena, mapped weight groups, other resident
+// tensors, buffers (mapped part of virtual ones), staging and stream ring slots.
+PyObject *Runtime_vram_bytes(RuntimeObject *self, PyObject *) {
+    size_t total = self->arena_bytes + self->staging_bytes;
+    if (self->wspace != nullptr) total += self->wspace->mapped;
+    for (auto &item : *self->tensors) {
+        const DeviceTensor &t = item.second;
+        if (t.resident && !t.in_arena && t.group < 0) total += t.nbytes;
+    }
+    for (auto &item : *self->buffers) total += item.second.resident_bytes();
+    if (self->ring_pool != nullptr) total += self->ring_pool_bytes * self->ring_pool->size();
     return PyLong_FromSize_t(total);
 }
 
@@ -1310,7 +1501,7 @@ PyObject *Runtime_set_arena(RuntimeObject *self, PyObject *args) {
 
 PyObject *Runtime_staging_bytes(RuntimeObject *self, PyObject *) {
     size_t total = self->staging_bytes;
-    if (self->ring != nullptr) total += self->ring->slot_bytes * self->ring->slots.size();
+    if (self->ring_pool != nullptr) total += self->ring_pool_bytes * self->ring_pool->size();
     return PyLong_FromSize_t(total);
 }
 
@@ -1365,38 +1556,88 @@ PyObject *Runtime_set_stream_order(RuntimeObject *self, PyObject *args) {
     Py_DECREF(fast);
     if (n == 0 || slots <= 0) Py_RETURN_NONE;
     if (slots > n) slots = static_cast<int>(n);
-    cudaError_t err = cudaStreamCreateWithFlags(&r.copy, cudaStreamNonBlocking);
+    if (self->ring_pool == nullptr) self->ring_pool = new std::vector<uint8_t *>();
+    std::vector<uint8_t *> &pool = *self->ring_pool;
+    cudaError_t err = cudaSuccess;
+    if (r.slot_bytes > self->ring_pool_bytes || static_cast<int>(pool.size()) < slots) {
+        // Grow the pool (only when no reservation covers this order).
+        const size_t bytes = r.slot_bytes > self->ring_pool_bytes ? r.slot_bytes : self->ring_pool_bytes;
+        for (auto *q : pool) cudaFree(q);
+        pool.clear();
+        self->ring_pool_bytes = 0;
+        for (int i = 0; i < slots && err == cudaSuccess; ++i) {
+            uint8_t *q = nullptr;
+            err = cudaMalloc(&q, bytes);
+            if (err == cudaSuccess) pool.push_back(q);
+        }
+        if (err == cudaSuccess) self->ring_pool_bytes = bytes;
+    }
+    if (err == cudaSuccess) err = cudaStreamCreateWithFlags(&r.copy, cudaStreamNonBlocking);
     for (int i = 0; i < slots && err == cudaSuccess; ++i) {
-        uint8_t *p = nullptr;
         cudaEvent_t a = nullptr, b = nullptr;
-        err = cudaMalloc(&p, r.slot_bytes);
-        if (err == cudaSuccess) err = cudaEventCreateWithFlags(&a, cudaEventDisableTiming);
+        err = cudaEventCreateWithFlags(&a, cudaEventDisableTiming);
         if (err == cudaSuccess) err = cudaEventCreateWithFlags(&b, cudaEventDisableTiming);
-        r.slots.push_back(p);
+        r.slots.push_back(pool[i]);
         r.ready.push_back(a);
         r.free_ev.push_back(b);
     }
+    r.slot_bytes = self->ring_pool_bytes;
     if (err != cudaSuccess) {
         r.destroy();
+        r.slots.clear();
         return cuda_error("stream ring allocation", err);
     }
+    Py_RETURN_NONE;
+}
+
+// reserve_ring(slot_bytes, slots): allocate the persistent ring slot pool up front (large enough for any
+// tensor that may be streamed later), so demoting / promoting weights never allocates device memory.
+PyObject *Runtime_reserve_ring(RuntimeObject *self, PyObject *args) {
+    Py_ssize_t bytes = 0;
+    int slots = 0;
+    if (!PyArg_ParseTuple(args, "ni", &bytes, &slots)) return nullptr;
+    if (self->ring_pool == nullptr) self->ring_pool = new std::vector<uint8_t *>();
+    std::vector<uint8_t *> &pool = *self->ring_pool;
+    if (static_cast<size_t>(bytes) <= self->ring_pool_bytes && static_cast<int>(pool.size()) >= slots) Py_RETURN_NONE;
+    if (self->ring != nullptr && self->ring->K() > 0) return PyErr_Format(PyExc_RuntimeError, "reserve_ring before set_stream_order");
+    for (auto *q : pool) cudaFree(q);
+    pool.clear();
+    self->ring_pool_bytes = 0;
+    for (int i = 0; i < slots; ++i) {
+        uint8_t *q = nullptr;
+        cudaError_t err = cudaMalloc(&q, static_cast<size_t>(bytes));
+        if (err != cudaSuccess) return cuda_error("reserve_ring", err);
+        pool.push_back(q);
+    }
+    self->ring_pool_bytes = static_cast<size_t>(bytes);
     Py_RETURN_NONE;
 }
 
 PyObject *Runtime_alloc(RuntimeObject *self, PyObject *args) {
     const char *name = nullptr;
     Py_ssize_t n = 0;
-    int elem = 4;
-    if (!PyArg_ParseTuple(args, "sn|i", &name, &n, &elem)) return nullptr;
+    int elem = 4, is_virtual = 0;
+    if (!PyArg_ParseTuple(args, "sn|ip", &name, &n, &elem, &is_virtual)) return nullptr;
     if (n <= 0) return PyErr_Format(PyExc_ValueError, "buffer %s size must be positive", name);
     if (elem != 4 && elem != 2) return PyErr_Format(PyExc_ValueError, "element size must be 4 (fp32) or 2 (fp16)");
     auto found = self->buffers->find(name);
     if (found != self->buffers->end()) {
-        cudaFree(found->second.data);
+        release_buffer(found->second);
         self->buffers->erase(found);
     }
     DeviceBuffer b;
     b.elem = elem;
+    b.n = static_cast<size_t>(n);
+    if (is_virtual) {  // address space only; map_range backs the ranges in use
+        b.vs = new VirtualSpace();
+        if (!vmm_reserve(*b.vs, b.bytes())) {
+            delete b.vs;
+            return PyErr_Format(PyExc_MemoryError, "cannot reserve %zu bytes of device address space for %s", b.bytes(), name);
+        }
+        b.data = reinterpret_cast<float *>(b.vs->base);
+        (*self->buffers)[name] = b;
+        Py_RETURN_NONE;
+    }
     cudaError_t err = cudaMalloc(&b.data, static_cast<size_t>(n) * elem);
     if (err == cudaSuccess) err = cudaMemset(b.data, 0, static_cast<size_t>(n) * elem);
     if (err != cudaSuccess) {
@@ -1413,14 +1654,165 @@ PyObject *Runtime_zero(RuntimeObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "s", &name)) return nullptr;
     DeviceBuffer *b = find_any_buffer(self, name);
     if (b == nullptr) return nullptr;
-    cudaError_t err = cudaMemset(b->data, 0, b->bytes());
+    cudaError_t err = cudaSuccess;
+    if (b->vs != nullptr) {  // virtual: clear the mapped granules only
+        for (size_t g = 0; g < b->vs->handle.size() && err == cudaSuccess; ++g)
+            if (b->vs->handle[g] != 0)
+                err = cudaMemset(reinterpret_cast<char *>(b->vs->base) + g * b->vs->gran, 0, b->vs->gran);
+    } else {
+        err = cudaMemset(b->data, 0, b->bytes());
+    }
     if (err != cudaSuccess) return cuda_error("cudaMemset", err);
     Py_RETURN_NONE;
 }
 
+// map_range(name, offset, n) -> bool: back elements [offset, offset + n) of a virtual buffer with device
+// memory (False = out of memory, nothing mapped). unmap_range releases them (refcounted per granule).
+PyObject *Runtime_map_range(RuntimeObject *self, PyObject *args) {
+    const char *name = nullptr;
+    Py_ssize_t off = 0, n = 0;
+    if (!PyArg_ParseTuple(args, "snn", &name, &off, &n)) return nullptr;
+    DeviceBuffer *b = find_any_buffer(self, name);
+    if (b == nullptr) return nullptr;
+    if (b->vs == nullptr) Py_RETURN_TRUE;  // ordinary buffers are always backed
+    if (off < 0 || n < 0 || static_cast<size_t>(off + n) > b->n) return PyErr_Format(PyExc_ValueError, "map_range out of bounds");
+    return PyBool_FromLong(vmm_map(*b->vs, static_cast<size_t>(off) * b->elem, static_cast<size_t>(n) * b->elem));
+}
+
+PyObject *Runtime_unmap_range(RuntimeObject *self, PyObject *args) {
+    const char *name = nullptr;
+    Py_ssize_t off = 0, n = 0;
+    if (!PyArg_ParseTuple(args, "snn", &name, &off, &n)) return nullptr;
+    DeviceBuffer *b = find_any_buffer(self, name);
+    if (b == nullptr) return nullptr;
+    if (b->vs == nullptr) Py_RETURN_NONE;
+    if (off < 0 || n < 0 || static_cast<size_t>(off + n) > b->n) return PyErr_Format(PyExc_ValueError, "unmap_range out of bounds");
+    vmm_unmap(*b->vs, static_cast<size_t>(off) * b->elem, static_cast<size_t>(n) * b->elem);
+    Py_RETURN_NONE;
+}
+
+PyObject *Runtime_vmm_granularity(RuntimeObject *, PyObject *) { return PyLong_FromSize_t(vmm_granularity()); }
+
+// map_cost(name, offset, n) -> bytes of device memory that map_range would newly map.
+PyObject *Runtime_map_cost(RuntimeObject *self, PyObject *args) {
+    const char *name = nullptr;
+    Py_ssize_t off = 0, n = 0;
+    if (!PyArg_ParseTuple(args, "snn", &name, &off, &n)) return nullptr;
+    DeviceBuffer *b = find_any_buffer(self, name);
+    if (b == nullptr) return nullptr;
+    if (b->vs == nullptr || n <= 0) return PyLong_FromLong(0);
+    const VirtualSpace &v = *b->vs;
+    const size_t lo = static_cast<size_t>(off) * b->elem, hi = static_cast<size_t>(off + n) * b->elem - 1;
+    size_t cost = 0;
+    for (size_t g = lo / v.gran; g <= hi / v.gran && g < v.refs.size(); ++g)
+        if (v.refs[g] == 0) cost += v.gran;
+    return PyLong_FromSize_t(cost);
+}
+
+// set_weight_space(nbytes): reserve device address space for demotable weight groups.
+PyObject *Runtime_set_weight_space(RuntimeObject *self, PyObject *args) {
+    Py_ssize_t nbytes = 0;
+    if (!PyArg_ParseTuple(args, "n", &nbytes)) return nullptr;
+    if (self->groups != nullptr && !self->groups->empty()) return PyErr_Format(PyExc_RuntimeError, "weight space in use");
+    if (self->wspace != nullptr) {
+        vmm_free(*self->wspace);
+        delete self->wspace;
+    }
+    self->wspace = new VirtualSpace();
+    if (!vmm_reserve(*self->wspace, static_cast<size_t>(nbytes))) return PyErr_Format(PyExc_MemoryError, "cannot reserve weight space");
+    if (self->groups == nullptr) self->groups = new std::vector<WeightGroup>();
+    Py_RETURN_NONE;
+}
+
+// add_weight_group(nbytes) -> id: map a granule-aligned region for one group's tensors.
+PyObject *Runtime_add_weight_group(RuntimeObject *self, PyObject *args) {
+    Py_ssize_t nbytes = 0;
+    if (!PyArg_ParseTuple(args, "n", &nbytes)) return nullptr;
+    if (self->wspace == nullptr) return PyErr_Format(PyExc_RuntimeError, "set_weight_space first");
+    VirtualSpace &v = *self->wspace;
+    size_t off = 0;
+    for (auto &g : *self->groups) off = g.off + g.bytes > off ? g.off + g.bytes : off;
+    WeightGroup g;
+    g.off = off;
+    g.bytes = (static_cast<size_t>(nbytes) + v.gran - 1) / v.gran * v.gran;
+    if (g.off + g.bytes > v.va_bytes) return PyErr_Format(PyExc_ValueError, "weight space exhausted");
+    if (!vmm_map(v, g.off, g.bytes)) return cuda_error("map weight group", cudaErrorMemoryAllocation);
+    g.mapped = true;
+    self->groups->push_back(g);
+    return PyLong_FromLong(static_cast<long>(self->groups->size() - 1));
+}
+
+// demote_group(id): its tensors move to pinned host memory (streamed from there); the region is unmapped.
+PyObject *Runtime_demote_group(RuntimeObject *self, PyObject *args) {
+    int id = 0;
+    if (!PyArg_ParseTuple(args, "i", &id)) return nullptr;
+    if (self->groups == nullptr || id < 0 || id >= static_cast<int>(self->groups->size()))
+        return PyErr_Format(PyExc_ValueError, "unknown weight group %d", id);
+    WeightGroup &g = (*self->groups)[id];
+    if (!g.mapped) Py_RETURN_NONE;
+    cudaDeviceSynchronize();
+    for (auto &name : g.tensors) {
+        DeviceTensor &t = (*self->tensors)[name];
+        if (ring_has(self, name.c_str())) return PyErr_Format(PyExc_RuntimeError, "%s is in the stream order", name.c_str());
+        cudaError_t err = cudaSuccess;
+        if (t.host == nullptr) {
+            err = cudaHostAlloc(reinterpret_cast<void **>(&t.host), t.nbytes, cudaHostAllocMapped | cudaHostAllocPortable);
+            if (err == cudaSuccess) err = cudaMemcpy(t.host, t.dev, t.nbytes, cudaMemcpyDeviceToHost);
+        }
+        if (err != cudaSuccess) return cuda_error("demote weight group", err);
+        t.data = t.host;
+        t.resident = false;
+    }
+    vmm_unmap(*self->wspace, g.off, g.bytes);
+    g.mapped = false;
+    Py_RETURN_NONE;
+}
+
+// promote_group(id) -> bool: map the region again and copy its tensors back (False = out of memory).
+PyObject *Runtime_promote_group(RuntimeObject *self, PyObject *args) {
+    int id = 0;
+    if (!PyArg_ParseTuple(args, "i", &id)) return nullptr;
+    if (self->groups == nullptr || id < 0 || id >= static_cast<int>(self->groups->size()))
+        return PyErr_Format(PyExc_ValueError, "unknown weight group %d", id);
+    WeightGroup &g = (*self->groups)[id];
+    if (g.mapped) Py_RETURN_TRUE;
+    for (auto &name : g.tensors)
+        if (ring_has(self, name.c_str())) return PyErr_Format(PyExc_RuntimeError, "%s is in the stream order", name.c_str());
+    if (!vmm_map(*self->wspace, g.off, g.bytes)) Py_RETURN_FALSE;
+    g.mapped = true;
+    for (auto &name : g.tensors) {
+        DeviceTensor &t = (*self->tensors)[name];
+        cudaError_t err = cudaMemcpy(t.dev, t.host, t.nbytes, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) return cuda_error("promote weight group", err);
+        t.data = t.dev;
+        t.resident = true;
+    }
+    Py_RETURN_TRUE;
+}
+
+// weight_groups() -> [(region bytes, mapped, [tensor names])]
+PyObject *Runtime_weight_groups(RuntimeObject *self, PyObject *) {
+    PyObject *out = PyList_New(0);
+    if (self->groups != nullptr) {
+        for (auto &g : *self->groups) {
+            PyObject *names = PyList_New(0);
+            for (auto &n : g.tensors) {
+                PyObject *u = PyUnicode_FromString(n.c_str());
+                PyList_Append(names, u);
+                Py_DECREF(u);
+            }
+            PyObject *item = Py_BuildValue("(nOO)", static_cast<Py_ssize_t>(g.bytes), g.mapped ? Py_True : Py_False, names);
+            Py_DECREF(names);
+            PyList_Append(out, item);
+            Py_DECREF(item);
+        }
+    }
+    return out;
+}
+
 PyObject *Runtime_buffer_bytes(RuntimeObject *self, PyObject *) {
     size_t total = 0;
-    for (auto &item : *self->buffers) total += item.second.bytes();
+    for (auto &item : *self->buffers) total += item.second.resident_bytes();
     return PyLong_FromSize_t(total);
 }
 
@@ -2221,6 +2613,18 @@ PyMethodDef Runtime_methods[] = {
     {"gated_delta_seg", reinterpret_cast<PyCFunction>(Runtime_gated_delta_seg), METH_VARARGS,
      "gated_delta_seg(conv, beta, alpha, ssm_a, dt_bias, state, out, kh, vh, kd, vd, eps, head_order[, snap])."},
     {"zero_range", reinterpret_cast<PyCFunction>(Runtime_zero_range), METH_VARARGS, "zero_range(name, offset, n)."},
+    {"map_range", reinterpret_cast<PyCFunction>(Runtime_map_range), METH_VARARGS,
+     "map_range(name, offset, n) -> bool: back a virtual buffer's elements with device memory."},
+    {"unmap_range", reinterpret_cast<PyCFunction>(Runtime_unmap_range), METH_VARARGS, "unmap_range(name, offset, n)."},
+    {"vmm_granularity", reinterpret_cast<PyCFunction>(Runtime_vmm_granularity), METH_NOARGS, "Physical mapping granule in bytes."},
+    {"map_cost", reinterpret_cast<PyCFunction>(Runtime_map_cost), METH_VARARGS, "map_cost(name, offset, n) -> new bytes."},
+    {"vram_bytes", reinterpret_cast<PyCFunction>(Runtime_vram_bytes), METH_NOARGS, "Device memory held by this runtime."},
+    {"set_weight_space", reinterpret_cast<PyCFunction>(Runtime_set_weight_space), METH_VARARGS, "set_weight_space(nbytes)."},
+    {"reserve_ring", reinterpret_cast<PyCFunction>(Runtime_reserve_ring), METH_VARARGS, "reserve_ring(slot_bytes, slots)."},
+    {"add_weight_group", reinterpret_cast<PyCFunction>(Runtime_add_weight_group), METH_VARARGS, "add_weight_group(nbytes) -> id."},
+    {"demote_group", reinterpret_cast<PyCFunction>(Runtime_demote_group), METH_VARARGS, "demote_group(id): weights to pinned host (streamed)."},
+    {"promote_group", reinterpret_cast<PyCFunction>(Runtime_promote_group), METH_VARARGS, "promote_group(id) -> bool."},
+    {"weight_groups", reinterpret_cast<PyCFunction>(Runtime_weight_groups), METH_NOARGS, "[(bytes, mapped, tensors)]."},
     {"concat_rows", reinterpret_cast<PyCFunction>(Runtime_concat_rows), METH_VARARGS, "concat_rows(dst, a, b, rows, width)."},
     {"buffer_elem", reinterpret_cast<PyCFunction>(Runtime_buffer_elem), METH_VARARGS,
      "buffer_elem(name) -> bytes per element (4 = fp32, 2 = fp16)."},

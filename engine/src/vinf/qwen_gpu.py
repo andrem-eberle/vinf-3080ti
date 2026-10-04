@@ -215,6 +215,9 @@ class QwenGpuExecutor:
         ssm_dtype: str = "f32",
         verify_rows: int = 64,
         batch_kernels: bool | None = None,
+        dynamic: bool = True,
+        reserve_tokens: int = 2048,
+        vram_budget: int | None = None,
         snapshot_tokens: int = 0,
         mtp: bool = False,
         placement: str = "hybrid",
@@ -266,7 +269,9 @@ class QwenGpuExecutor:
         self.max_seqs = max_seqs
         self.page_size = max(1, min(page_size, max_context))
         self.pages_per_seq = -(-max_context // self.page_size)
-        pool = max_context if kv_pool_tokens is None else max(kv_pool_tokens, self.page_size)
+        if kv_pool_tokens is None:  # dynamic: address space for every slot at full context (mapped on use)
+            kv_pool_tokens = max_context * max_seqs if dynamic else max_context
+        pool = max(kv_pool_tokens, self.page_size)
         self.kv_pages = -(-pool // self.page_size)
         self.reclaim = None  # optional callback(pages_needed) -> bool that frees idle sequences
         # Rows of a verification pass: every sequence's next input plus its drafts (capped; with many
@@ -274,10 +279,20 @@ class QwenGpuExecutor:
         self.verify_rows = max(max_batch, max_seqs, min(verify_rows, max_seqs * snapshot_tokens))
         # SSM recurrent state precision on the GPU (fp16 halves the per-sequence state; math stays fp32).
         self.ssm_dtype = ssm_dtype
-        # Several sequences: every pass uses the prompt kernels (tensor-core GEMM, tiled attention), whose
-        # per-row results do not depend on how many rows share the pass, so a sequence's output does not
-        # depend on its neighbours and large batches stay cheap.
-        self.batch_kernels = max_seqs > 1 if batch_kernels is None else batch_kernels
+        # Decode / verification kernels: None ("auto") uses the matvec kernels for passes of up to 8 rows
+        # (fastest for a lone sequence) and the tensor-core GEMM above; True forces the GEMM for every pass
+        # (per-row results independent of batch size: a sequence's output never depends on its
+        # neighbours); False keeps the matvec kernels for every pass.
+        self.batch_kernels = batch_kernels
+        # Shared VRAM: KV pages and per-sequence state are mapped only while used (CUDA virtual memory);
+        # weights fill the rest and are demoted to streaming when sequences need room, promoted back when
+        # they leave. Only a small working reserve (one sequence, reserve_tokens of KV) is planned up front.
+        self.dynamic = dynamic
+        self.reserve_tokens = reserve_tokens
+        self.vram_budget = vram_budget
+        self.safety_bytes = safety_bytes
+        self.weight_groups: dict[int, int] = {}  # layer -> runtime weight group id
+        self.demoted: list[int] = []  # layers whose resident weights currently stream
         # Rows per prompt-processing pass: each streamed weight crosses PCIe once per pass, so wide passes
         # make prefill compute-bound instead of PCIe-bound. DFlash feature capture keeps max_batch rows.
         self.prefill_batch = max(max_batch, prefill_batch) if not capture_layers else max_batch
@@ -301,6 +316,9 @@ class QwenGpuExecutor:
             free_vram_bytes = self.rt.mem_info()[0]
         if placement == "hybrid":
             self.cpu_layers = self._choose_cpu_layers(free_vram_bytes, safety_bytes)
+            if self.cpu_layers:  # CPU layers: one sequence, static memory, contiguous KV
+                self.dynamic = False
+                self.page_size, self.pages_per_seq, self.kv_pages = max_context, 1, 1
         self.plan = self._plan(free_vram_bytes, safety_bytes)
         while placement == "hybrid" and self.plan.streamed_bytes:
             # Keep weights where they are computed: push the first streamed layer (and all after it) to the CPU.
@@ -315,8 +333,9 @@ class QwenGpuExecutor:
             if self.max_seqs > 1:
                 raise ConfigurationError("the model does not fit the GPU with hybrid placement and several "
                                          "sequences; CPU layers run a single sequence (use --max-seqs 1)")
-            if self.page_size != max_context:
+            if self.page_size != max_context or self.dynamic:
                 self.page_size, self.pages_per_seq, self.kv_pages = max_context, 1, 1
+                self.dynamic = False
                 self.plan = self._plan(free_vram_bytes, safety_bytes)
             from vinf.cpu_qwen import CpuQwenRuntime
 
@@ -326,6 +345,9 @@ class QwenGpuExecutor:
         self.free_slots = list(range(self.max_seqs))
         self.free_pages = list(range(self.kv_pages))
         self.sequences: list[Sequence] = []
+        if self.dynamic and self.vram_budget is None:
+            # Everything we may use: what we hold now plus what was still free, minus the safety margin.
+            self.vram_budget = self.used_vram() + self.rt.mem_info()[0] - self.safety_bytes
         self.seq = self.new_sequence()  # the active sequence of the single-sequence API
 
     @classmethod
@@ -341,6 +363,7 @@ class QwenGpuExecutor:
         self.max_seqs, self.page_size, self.pages_per_seq = 1, max_context, 1
         self.kv_pages, self.verify_rows = 1, 8
         self.ssm_dtype, self.batch_kernels = "f32", False
+        self.dynamic, self.reserve_tokens = False, 2048
         self.mtp_layer = None
         self.placement, self.cpu_layers, self.cpu = "stream", frozenset(), None
         self.capture_layers, self.reserve_extra_bytes = (), 0
@@ -523,6 +546,12 @@ class QwenGpuExecutor:
         ssm = sum(n * self._state_elem(name) for name, n in states.items() if name.startswith(("conv", "ssm")))
         # + kernel/runtime slack + memory reserved for an external drafter (e.g. DFlash weights)
         activations = sum(self._buffer_specs().values()) * 4 + 32 * 1024**2 + self.reserve_extra_bytes
+        if getattr(self, "dynamic", False):
+            # Only the working reserve: one sequence's state and reserve_tokens of KV (mapped on demand,
+            # more comes from demoting weights); per-layer weight groups round up to the VMM granule.
+            kv = self.kv_bytes_per_token() * min(self.max_context, self.reserve_tokens)
+            ssm = ssm // self.max_seqs
+            activations += (len(self.schedule) + 2) * 2 * 1024**2
         gpu_layers = [i for i in range(len(self.schedule)) if i not in self.cpu_layers]
         return plan_qwen_decode_residency(
             self.gguf,
@@ -555,10 +584,29 @@ class QwenGpuExecutor:
         if unsupported:
             raise UnsupportedModelError("no CUDA kernel for tensor types: " + ", ".join(unsupported))
         resident = [e for e in entries if e.residency is TensorResidency.GPU]
-        self.rt.set_arena(sum((e.nbytes + 16 + 255) // 256 * 256 for e in resident))
+        padded = lambda e: (e.nbytes + 16 + 255) // 256 * 256  # noqa: E731
+        group_of: dict[str, int] = {}
+        if self.dynamic:
+            # Each decoder layer's resident tensors share a granule-aligned group that can be demoted.
+            gran = self.rt.vmm_granularity()
+            matvec = set(qwen_qmv_order(self.schedule))  # elementwise weights (norms, conv, ssm_a) stay put
+            by_layer: dict[int, list] = {}
+            for e in resident:
+                layer = self._layer_of(e.name) if e.name.startswith("blk.") else None
+                if layer is not None and layer != self.mtp_layer and e.name in matvec:
+                    by_layer.setdefault(layer, []).append(e)
+            sizes = {layer: sum(padded(e) for e in es) for layer, es in by_layer.items()}
+            self.rt.set_weight_space(sum(-(-n // gran) * gran for n in sizes.values()) + gran)
+            for layer in sorted(by_layer):
+                self.weight_groups[layer] = self.rt.add_weight_group(sizes[layer])
+                for e in by_layer[layer]:
+                    group_of[e.name] = self.weight_groups[layer]
+        static = [e for e in resident if e.name not in group_of]
+        self.rt.set_arena(sum(padded(e) for e in static))
         for idx, entry in enumerate(entries):
             self.rt.upload_gguf_tensor(
-                self.gguf, entry.name, resident=entry.residency is TensorResidency.GPU
+                self.gguf, entry.name, resident=entry.residency is TensorResidency.GPU,
+                group=group_of.get(entry.name, -1),
             )
             if progress is not None:
                 progress(idx + 1, len(entries), entry)
@@ -566,11 +614,109 @@ class QwenGpuExecutor:
             for layer_idx in sorted(self.cpu_layers):
                 for name in self._layer_weight_names(layer_idx):
                     self.cpu.add_gguf_tensor(self.gguf, name)
-        streamed = set(self.plan.names(TensorResidency.PINNED_STREAM))
+        self._streamed = set(self.plan.names(TensorResidency.PINNED_STREAM))
+        if self.dynamic:  # ring slots sized for any tensor that may stream later (demoted layers)
+            candidates = self._streamed | set(group_of)
+            if candidates:
+                self.rt.reserve_ring(max(self.gguf.tensors[n].nbytes for n in candidates), self.stream_slots)
+        self._apply_stream_order()
+
+    def _apply_stream_order(self) -> None:
+        streamed = self._streamed
         order = [name for name in qwen_qmv_order(self.schedule) if name in streamed]
         if set(order) != streamed:
             raise UnsupportedModelError(f"streamed tensors outside the qmv order: {sorted(streamed - set(order))}")
         self.rt.set_stream_order(order, self.stream_slots)
+
+    # ---- shared VRAM: weight demotion / promotion ---------------------------------------------------
+
+    def demote_layer(self) -> bool:
+        """Free VRAM by moving the last resident decoder layer's weights to streaming."""
+        resident = [layer for layer in self.weight_groups if layer not in self.demoted]
+        if not resident:
+            return False
+        layer = max(resident)
+        names = list(self.rt.weight_groups()[self.weight_groups[layer]][2])
+        self.rt.set_stream_order([], 0)  # the ring must not hold the group's tensors while it changes
+        self.rt.demote_group(self.weight_groups[layer])
+        self.demoted.append(layer)
+        self._demoted_names = getattr(self, "_demoted_names", {})
+        self._demoted_names[layer] = names
+        self._streamed |= set(names)
+        self._apply_stream_order()
+        return True
+
+    def promote_layers(self, make_room=None) -> int:
+        """Bring demoted layers back into VRAM while it fits (make_room() may free idle memory first).
+        Returns the number of layers promoted."""
+        done = 0
+        for layer in sorted(self.demoted):
+            group = self.weight_groups[layer]
+            names = self._demoted_names[layer]
+            self.rt.set_stream_order([], 0)
+            ok = self._fits(self._group_bytes(layer)) and self.rt.promote_group(group)
+            while not ok and make_room is not None and make_room():
+                ok = self._fits(self._group_bytes(layer)) and self.rt.promote_group(group)
+            if not ok:
+                self._apply_stream_order()
+                break
+            self.demoted.remove(layer)
+            self._streamed -= set(names)
+            self._apply_stream_order()
+            done += 1
+        return done
+
+    def _group_bytes(self, layer: int) -> int:
+        return self.rt.weight_groups()[self.weight_groups[layer]][0]
+
+    def used_vram(self) -> int:
+        return self.rt.vram_bytes()
+
+    def _fits(self, extra: int) -> bool:
+        return self.vram_budget is None or self.used_vram() + extra <= self.vram_budget
+
+    def _make_room(self) -> bool:
+        """Memory pressure: evict an idle sequence (prefix cache) first, then demote a weight layer."""
+        if self.reclaim is not None and self.reclaim(0):  # evicts one idle sequence
+            return True
+        return self.dynamic and self.demote_layer()
+
+    def _map(self, ranges: list[tuple[str, int, int]]) -> None:
+        """Back (buffer, offset, n) ranges of virtual buffers with device memory, making room as needed."""
+        if not self.dynamic:
+            return
+        while True:
+            need = sum(self.rt.map_cost(name, off, n) for name, off, n in ranges)
+            if self._fits(need):
+                mapped = []
+                for name, off, n in ranges:
+                    if not self.rt.map_range(name, off, n):
+                        break
+                    mapped.append((name, off, n))
+                else:
+                    return
+                for name, off, n in mapped:
+                    self.rt.unmap_range(name, off, n)
+            if not self._make_room():
+                raise KvPoolExhausted(
+                    f"out of VRAM for sequence state: need {need / 2**20:.0f} MiB, using {self.used_vram() / 2**20:.0f} "
+                    f"of {(self.vram_budget or 0) / 2**20:.0f} MiB with {len(self.demoted)} layers demoted "
+                    "(nothing left to demote or evict)")
+
+    def _unmap(self, ranges: list[tuple[str, int, int]]) -> None:
+        if self.dynamic:
+            for name, off, n in ranges:
+                self.rt.unmap_range(name, off, n)
+
+    def _page_ranges(self, pages: list[int]) -> list[tuple[str, int, int]]:
+        s = self.shapes
+        pe = s.kv_heads * self.page_size * s.head_dim
+        return [(f"{kind}.{layer}", pg * pe, pe) for pg in pages for layer in self._kv_layers() for kind in ("kc", "vc")]
+
+    def _slot_ranges(self, slot: int) -> list[tuple[str, int, int]]:
+        specs = self._state_specs()
+        return [(name, slot * (specs[name] // self.max_seqs), specs[name] // self.max_seqs)
+                for name in self._recurrent_names() if self._layer_of(name) not in self.cpu_layers]
 
     def _alloc_buffers(self) -> None:
         if self.ssm_dtype == "f16" and QwenLayerKind.LINEAR_ATTENTION in self.schedule:
@@ -580,10 +726,8 @@ class QwenGpuExecutor:
         for name, n in self._buffer_specs().items():
             self.rt.alloc(name, n)
         for name, n in self._gpu_state_specs().items():
-            if self._state_elem(name) == 4:
-                self.rt.alloc(name, n)
-            else:
-                self.rt.alloc(name, n, self._state_elem(name))
+            virtual = self.dynamic and (name.startswith(("kc.", "vc.", "conv.", "ssm.")))
+            self.rt.alloc(name, n, self._state_elem(name), virtual)
         if self.cpu is not None:
             for name, n in {**self._buffer_specs(), **self._cpu_state_specs()}.items():
                 self.cpu.alloc(name, n)
@@ -591,10 +735,13 @@ class QwenGpuExecutor:
         self.prompt_mode(False)
 
     def prompt_mode(self, on: bool) -> None:
-        """Prompt passes use the tensor-core GEMM and tiled attention; with several sequences every pass does."""
+        """Prompt passes use the tensor-core GEMM and tiled attention; decode passes per batch_kernels."""
         gemm = getattr(self.rt, "set_gemm_min_rows", None)
         if gemm is not None:
-            gemm(1 if on or self.batch_kernels else 0)
+            if on or self.batch_kernels is True:
+                gemm(1)
+            else:
+                gemm(MAX_BATCH + 1 if self.batch_kernels is None and self.max_seqs > 1 else 0)
 
     # ---- sequences ------------------------------------------------------------------------------
 
@@ -610,7 +757,10 @@ class QwenGpuExecutor:
         """A fresh sequence in a free slot (state zeroed, no pages yet)."""
         if not self.free_slots:
             raise KvPoolExhausted(f"all {self.max_seqs} sequence slots are in use")
-        seq = Sequence(self.free_slots.pop(0))
+        slot = self.free_slots[0]
+        self._map(self._slot_ranges(slot))
+        self.free_slots.pop(0)
+        seq = Sequence(slot)
         self.sequences.append(seq)
         self._zero_slot(seq.slot)
         return seq
@@ -620,6 +770,7 @@ class QwenGpuExecutor:
         if seq not in self.sequences:
             return
         self.sequences.remove(seq)
+        self._unmap(self._page_ranges(seq.pages) + self._slot_ranges(seq.slot))
         self.free_pages.extend(seq.pages)
         seq.pages, seq.tokens = [], []
         self.free_slots.append(seq.slot)
@@ -642,7 +793,9 @@ class QwenGpuExecutor:
                 raise KvPoolExhausted(
                     f"KV pool exhausted: need {need} more pages of {self.page_size} tokens, "
                     f"{len(self.free_pages)} free of {self.kv_pages}")
-        seq.pages.extend(self.free_pages[:need])
+        new = self.free_pages[:need]
+        self._map(self._page_ranges(new))
+        seq.pages.extend(new)
         del self.free_pages[:need]
         self.rt.write("page_table", array("i", seq.pages).tobytes(), seq.slot * self.pages_per_seq)
 

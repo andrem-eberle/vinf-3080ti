@@ -118,7 +118,7 @@ class QwenBackend:
         if args.executor == "megakernel" and speculative > 0:
             log("note: --speculative runs on the per-op executor; megakernel decodes without speculation")
             speculative = 0
-        max_seqs = getattr(args, "max_seqs", None) or (4 if getattr(args, "serve", False) else 1)
+        max_seqs = getattr(args, "max_seqs", None) or (16 if getattr(args, "serve", False) else 1)
         if args.executor == "megakernel" or args.placement == "hybrid":
             max_seqs = 1
         dflash_ck = None
@@ -152,12 +152,16 @@ class QwenBackend:
             page_size=args.max_context if args.executor == "megakernel" else 256,
             ssm_dtype=getattr(args, "ssm_dtype", "f32"),
             verify_rows=getattr(args, "verify_rows", 64),
+            dynamic=args.executor != "megakernel",
+            batch_kernels=True if getattr(args, "batch_invariant", False) else None,
+            vram_budget=getattr(args, "vram_mib", None) and args.vram_mib * 1024**2,
             progress=progress,
         )
         log(executor.report())
-        if executor.max_seqs > 1:
-            log(f"concurrency: {executor.max_seqs} sequences sharing a KV pool of "
-                f"{executor.kv_pages * executor.page_size} tokens ({executor.kv_pages} pages of {executor.page_size})")
+        if executor.dynamic:
+            log(f"shared VRAM: budget {executor.vram_budget / 1024**3:.2f} GiB; up to {executor.max_seqs} sequences; "
+                f"KV pages and sequence state are mapped on use, weight layers are demoted to streaming when "
+                f"sequences need room and promoted back when idle")
         log(f"load time {time.perf_counter() - t0:.1f}s; device weights {executor.rt.device_bytes() / 1024**3:.2f} GiB, "
             f"pinned host {executor.rt.pinned_bytes() / 1024**3:.2f} GiB")
         name = getattr(args, "served_model_name", None) or str(gguf.metadata_value("general.name") or Path(args.model).stem)

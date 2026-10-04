@@ -75,7 +75,7 @@ cuda-gguf-upload:
 
 cuda-qwen-runtime:
 	mkdir -p build
-	PYTHONPATH=src $(PYTHON) -c "from vinf.cuda.build import cuda_extension_compile_command; import subprocess; cmd=cuda_extension_compile_command('.', source='csrc/megakernel/qwen_runtime.cu', output='src/vinf/_cuda_qwen_runtime.so'); print(' '.join(cmd)); subprocess.check_call(cmd)"
+	PYTHONPATH=src $(PYTHON) -c "from vinf.cuda.build import cuda_extension_compile_command; import subprocess; cmd=cuda_extension_compile_command('.', source='csrc/megakernel/qwen_runtime.cu', output='src/vinf/_cuda_qwen_runtime.so', extra_flags=('-lcuda',)); print(' '.join(cmd)); subprocess.check_call(cmd)"
 	PYTHONPATH=src $(PYTHON) -c "from vinf.cuda.qwen_runtime import CudaWeightRuntime; print(CudaWeightRuntime().mem_info())"
 
 # -dlcm=cg: global loads bypass L1 so data written by other SMs during the launch is coherent.

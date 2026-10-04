@@ -39,13 +39,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kv-dtype", choices=("f16", "f32"), default="f16",
                         help="attention KV cache precision (f16 halves its VRAM; the megakernel uses f32)")
     parser.add_argument("--max-seqs", type=int, default=None,
-                        help="concurrent sequences, up to 64 (default 4 with --serve, else 1); they share the KV pool")
+                        help="concurrent sequences, up to 64 (default 16 with --serve, else 1); memory is taken only while used")
     parser.add_argument("--ssm-dtype", choices=("f32", "f16"), default="f32",
                         help="SSM recurrent state precision on the GPU (f16 halves the ~150 MB per sequence)")
     parser.add_argument("--verify-rows", type=int, default=64,
                         help="max rows of a multi-sequence verification pass (drafts per sequence shrink to fit)")
+    parser.add_argument("--batch-invariant", action="store_true",
+                        help="use the tensor-core kernels for every pass, so a request's output never depends on "
+                             "what runs beside it (slower for a lone request)")
+    parser.add_argument("--vram-mib", type=int, default=None,
+                        help="cap on the VRAM the engine uses (default: what is free at load minus --safety-mib)")
     parser.add_argument("--kv-pool-tokens", type=int, default=None,
-                        help="KV cache tokens shared by all sequences (default: --max-context)")
+                        help="KV address space shared by all sequences (default: --max-context per sequence; mapped on use)")
     parser.add_argument("--prefix-cache-mib", type=int, default=8192,
                         help="host memory for prompt prefix checkpoints (0 disables); reuses earlier turns of a conversation")
     parser.add_argument("--report-only", action="store_true", help="print memory/residency plan and exit")

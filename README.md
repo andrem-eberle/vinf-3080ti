@@ -181,23 +181,16 @@ request with `"reasoning_effort": "none"` or `"chat_template_kwargs": {"enable_t
 the whole server with `--no-think`. Decoding is greedy: `temperature` / `top_p` are accepted and ignored
 (`--strict-sampling` rejects them instead). `--api-key KEY` requires `Authorization: Bearer KEY`.
 Concurrent requests (several agents on the same port) are decoded together: one pass per step computes the
-next token of every generating request, so the weights cross PCIe once for all of them. `--max-seqs N`
-(default 4 with `--serve`) sets how many run at once; they share a KV cache pool of `--kv-pool-tokens`
-(default `--max-context`). Every request keeps MTP speculation inside the shared pass; when the pool runs out,
-the newest request is
-swapped to host RAM and resumes later. Each request's output is identical to running it alone.
+next tokens of every generating request (each keeps its MTP speculation), so the weights cross PCIe once for all
+of them. Nothing is reserved per request: VRAM is shared. Weights fill it at load; KV pages and per-request state
+are mapped only while a request runs (CUDA virtual memory), and when requests need room, whole weight layers
+move to streaming; they come back when the server is idle. `--max-seqs N` (default 16, up to 64) only caps how
+many requests run at once. `--vram-mib` caps the engine's VRAM use, `--ssm-dtype f16` halves the per-request SSM
+state, and `--batch-invariant` makes every pass use the tensor-core kernels so a request's output never depends
+on what runs beside it (slower for a lone request).
 
-Total throughput with concurrent requests (Qwen3.8-27B UD-Q3_K_XL, `--max-context 32768`, 100 new tokens each,
-including prompt processing):
-
-| `--max-seqs` | Requests at once | Total tok/s |
-|---:|---:|---:|
-| 4 | 1 / 2 / 4 | 8.6 / 13.2 / 18.1 |
-| 16 (`--ssm-dtype f16`) | 1 / 8 / 16 | 6.2 / 30.1 / 39.3 |
-
-More slots hold more per-sequence state in VRAM (fewer weights on the GPU), which slows a lone request; pick
-`--max-seqs` for the expected number of agents. `--ssm-dtype f16` halves the SSM state per sequence (~80 MB instead
-of ~150 MB). With many sequences, drafts per sequence shrink so a verification pass stays within `--verify-rows`.
+Throughput (Qwen3.8-27B UD-Q3_K_XL, `--max-context 32768 --ssm-dtype f16`, 100 new tokens per request, including
+prompt processing): 1 request 12.5 tok/s, 16 concurrent requests 44.3 tok/s total.
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
