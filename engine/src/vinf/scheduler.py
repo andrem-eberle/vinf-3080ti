@@ -4,10 +4,10 @@ One thread owns the GPU. Each iteration it
   1. admits waiting requests while a sequence slot and enough KV pages are available (resuming from the
      prefix cache when a prompt extends an earlier one),
   2. runs one prompt pass (up to prefill_batch tokens) for the oldest request still processing its prompt,
-  3. runs one decode step for every request that is generating: a single pass with one row per
-     sequence, so the weights are read (and streamed over PCIe) once for all of them. When exactly one
-     request is generating and none is processing a prompt, the step is a speculative draft + verify
-     (MTP) instead, which is faster for a single stream.
+  3. runs one decode step for every request that is generating: a single pass for all of them, so the
+     weights are read (and streamed over PCIe) once. With MTP, every sequence contributes its next input
+     plus its drafts and keeps its accepted prefix (speculative decoding inside the shared pass);
+     without a drafter (or before its first draft) each sequence contributes one row.
 Greedy decoding is deterministic per sequence: a request produces the same tokens whatever runs beside it.
 
 When the KV page pool runs out mid-generation, the most recently admitted other request is swapped out
@@ -79,6 +79,8 @@ class Scheduler:
         self.running: list[Job] = []
         self.admissions = 0
         self.passes = 0
+        self.spec_passes = 0  # verification passes with more than one sequence
+        self.accepted = 0  # accepted draft tokens
         self.thread = threading.Thread(target=self._loop, name="vinf-scheduler", daemon=True)
         self.thread.start()
 
@@ -124,8 +126,8 @@ class Scheduler:
             self._prefill_pass(prefilling[0])
         decoding = [j for j in self.running if j.state == "decode" and not j.cancelled.is_set()]
         if decoding:
-            if len(decoding) == 1 and not prefilling and self.decoder is not None and self._spec_ok(decoding[0]):
-                self._spec_step(decoding[0])
+            if self.decoder is not None and all(self._spec_ok(j) for j in decoding):
+                self._spec_batch_step(decoding)
             else:
                 self._batch_step(decoding)
 
@@ -255,6 +257,52 @@ class Scheduler:
             return
         self.passes += 1
         self._emit(job, emitted)
+
+    def _spec_batch_step(self, jobs: list[Job]) -> None:
+        """Draft for every sequence, verify all drafts in one pass, keep each sequence's accepted prefix."""
+        ex, dec = self.ex, self.decoder
+        drafter = dec.drafter
+        rows = []
+        for job in jobs:
+            seq = job.seq
+            ex.activate(seq)
+            drafter.bind(seq)
+            k = min(dec.k, ex.max_context - seq.position - 1, job.max_new - len(job.out) - 1)
+            drafts = drafter.draft(job.out[-1], seq.position, k) if k >= 1 else []
+            rows.append([job.out[-1]] + drafts)
+        seqs = [j.seq for j in jobs]
+
+        def run():
+            ex.forward_verify(seqs, rows)
+            return ex.greedy_rows()
+
+        try:
+            targets = self._with_pages(jobs[0], run, group=jobs)
+        except KvPoolExhausted as exc:
+            for job in jobs:
+                self._finish(job, error=exc)
+            return
+        if targets is None:
+            return
+        self.passes += 1
+        keeps, emitted, row0 = [], [], 0
+        for job, r in zip(jobs, rows):
+            t = targets[row0 : row0 + len(r)]
+            drafts = r[1:]
+            accepted = 0
+            while accepted < len(drafts) and drafts[accepted] == t[accepted]:
+                accepted += 1
+            keep = accepted + 1
+            drafter.bind(job.seq)
+            drafter.observe_verify(job.seq.position - len(r), keep, t[:keep], src_row=row0)
+            keeps.append(keep)
+            emitted.append(t[:keep])
+            row0 += len(r)
+        ex.commit(keeps)
+        self.spec_passes += len(jobs) > 1
+        self.accepted += sum(keeps) - len(keeps)
+        for job, toks in zip(jobs, emitted):
+            self._emit(job, toks)
 
     def _batch_step(self, jobs: list[Job]) -> None:
         ex = self.ex

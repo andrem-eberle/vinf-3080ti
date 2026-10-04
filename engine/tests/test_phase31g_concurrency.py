@@ -112,7 +112,8 @@ class SchedulerTests(unittest.TestCase):
 
     def test_concurrent_mtp_speculative(self):
         b = backend(self, speculative=3, max_seqs=3, kv_pool_tokens=2048)
-        self.check(b, prompts(3, seed=4), [14, 6, 10])
+        jobs, sched = self.check(b, prompts(3, seed=4), [14, 6, 10])
+        self.assertGreater(sched.spec_passes, 0)  # drafts verified for several sequences in one pass
 
     def test_prefix_resume_and_shared_prefix_copy(self):
         b = backend(self, speculative=3, max_seqs=3, kv_pool_tokens=2048)

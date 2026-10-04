@@ -130,10 +130,11 @@ class MtpDrafter:
             pos += 1
         return drafts
 
-    def observe_verify(self, position: int, keep: int, emitted: list[int]) -> None:
+    def observe_verify(self, position: int, keep: int, emitted: list[int], src_row: int = 0) -> None:
+        """src_row: the sequence's first row in the verification pass (multi-sequence passes)."""
         h = self.ex.shapes.hidden
         src = "xn" if self.target_hidden == "post" else "h"  # greedy_rows() left post-norm rows in "xn"
-        self.ex.rt.copy("spec_pend", self.row_base * h, src, 0, keep * h)
+        self.ex.rt.copy("spec_pend", self.row_base * h, src, src_row * h, keep * h)
         self.pending_tokens, self.pending_pos = list(emitted), position
 
 

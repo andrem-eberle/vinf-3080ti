@@ -394,11 +394,15 @@ __global__ void __launch_bounds__(32 * kTcWarps) attention_tc_kernel(
 
 // Causal depthwise conv + SiLU stepping through ntok tokens. state: [channel][K] (last K inputs).
 // snap (optional): state after each token, [ntok][channel][K].
+// write_state = 0 leaves the state untouched (speculative verification; see the commit replay).
+constexpr int kConvMaxK = 8;
 __global__ void conv_update_kernel(const float *x, float *state, const float *w, float *out, int channels, int K,
-                                   int ntok, float *snap) {
+                                   int ntok, float *snap, int write_state) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
-    float *st = state + static_cast<size_t>(c) * K;
+    float *gst = state + static_cast<size_t>(c) * K;
+    float st[kConvMaxK];
+    for (int k = 0; k < K; ++k) st[k] = gst[k];
     for (int t = 0; t < ntok; ++t) {
         for (int k = 0; k < K - 1; ++k) st[k] = st[k + 1];
         st[K - 1] = x[static_cast<size_t>(t) * channels + c];
@@ -410,6 +414,8 @@ __global__ void conv_update_kernel(const float *x, float *state, const float *w,
             for (int k = 0; k < K; ++k) dst[k] = st[k];
         }
     }
+    if (write_state)
+        for (int k = 0; k < K; ++k) gst[k] = st[k];
 }
 
 // Gated delta rule with the state in registers. Every state column j evolves independently given the
@@ -422,7 +428,8 @@ constexpr int kGdP = 4;
 template <int R>
 __global__ void __launch_bounds__(32 * kGdP) gated_delta_reg_kernel(
     const float *conv_out, const float *beta_raw, const float *alpha_raw, const float *ssm_a, const float *dt_bias,
-    float *state, float *out, int key_heads, int value_heads, int vd, float eps, int head_order, int ntok, float *snap) {
+    float *state, float *out, int key_heads, int value_heads, int vd, float eps, int head_order, int ntok, float *snap,
+    int write_state) {
     constexpr int kd = R * kGdP;
     __shared__ float qraw[kd], kraw[kd];
     __shared__ float red_n[2][kGdP], red_k[kGdP][32], red_o[kGdP][32];
@@ -495,8 +502,10 @@ __global__ void __launch_bounds__(32 * kGdP) gated_delta_reg_kernel(
             out[static_cast<size_t>(t) * value_heads * vd + h * vd + j] = o_all;
         }
     }
+    if (write_state) {
 #pragma unroll
-    for (int r = 0; r < R; ++r) S[static_cast<size_t>(p * R + r) * vd + j] = st[r];
+        for (int r = 0; r < R; ++r) S[static_cast<size_t>(p * R + r) * vd + j] = st[r];
+    }
 }
 
 // Gated delta rule stepping through ntok tokens. grid = value_heads, block = vd threads (thread j owns
@@ -557,6 +566,7 @@ __global__ void gated_delta_kernel(const float *conv_out, const float *beta_raw,
 
 constexpr int kRowsPerBlock = 8;
 constexpr int kMaxTokens = 8;
+constexpr int kMaxArgmaxRows = 64;
 
 // One warp per row; lanes stride over 8-element chunks so neighbouring lanes read
 // neighbouring weight bytes. Each dequantized chunk is applied to NT activation rows
@@ -1126,7 +1136,7 @@ int Runtime_init(RuntimeObject *self, PyObject *args, PyObject *kwargs) {
     if (self->tensors == nullptr) self->tensors = new std::unordered_map<std::string, DeviceTensor>();
     if (self->buffers == nullptr) self->buffers = new std::unordered_map<std::string, DeviceBuffer>();
     if (self->argmax_out == nullptr) {
-        err = cudaMalloc(&self->argmax_out, kMaxTokens * sizeof(int));
+        err = cudaMalloc(&self->argmax_out, kMaxArgmaxRows * sizeof(int));
         if (err != cudaSuccess) {
             cuda_error("cudaMalloc argmax", err);
             return -1;
@@ -1477,8 +1487,9 @@ PyObject *Runtime_qmv(RuntimeObject *self, PyObject *args) {
     if (err != cudaSuccess) return cuda_error(t->resident ? "qmv" : "qmv stream (staging too small?)", err);
     TypeTraits tt;
     type_traits(t->type, &tt);
-    const int gemm_from = self->gemm_min_rows > 0 ? self->gemm_min_rows : kMaxTokens + 1;
-    if (ntok >= gemm_from) {
+    // The GEMM only runs in prompt mode (gemm_min_rows > 0): decode and verification rows keep the matvec
+    // kernels, so a sequence's tokens do not depend on how many rows share its pass.
+    if (self->gemm_min_rows > 0 && ntok >= self->gemm_min_rows) {
         // Prompt passes: tensor-core GEMM; the (possibly streamed) weight crosses PCIe once for all rows.
         const int ntok_pad = (ntok + kGemmBN - 1) / kGemmBN * kGemmBN;
         const size_t need = static_cast<size_t>(ntok_pad) * t->cols;
@@ -1686,22 +1697,30 @@ PyObject *Runtime_conv_update(RuntimeObject *self, PyObject *args) {
         snap = find_buffer(self, snapname, static_cast<size_t>(channels) * K * (ntok - 1));
         if (snap == nullptr) return nullptr;
     }
-    conv_update_kernel<<<blocks_for(channels, 256), 256>>>(x, st, w, o, channels, K, ntok, snap);
+    if (K > kConvMaxK) return PyErr_Format(PyExc_ValueError, "conv kernel size %d > %d", K, kConvMaxK);
+    conv_update_kernel<<<blocks_for(channels, 256), 256>>>(x, st, w, o, channels, K, ntok, snap, 1);
     return launch_result("conv_update");
 }
 
+// write_state = 0 leaves the state untouched (speculative verification); `scratch` (value_heads*kd*vd floats)
+// is needed then by the fallback kernel, which updates its state in place.
 void launch_gated_delta(const float *conv, const float *b, const float *a, const float *ssm_a, const float *dt, float *st,
                         float *o, int key_heads, int value_heads, int kd, int vd, float eps, int head_order, int ntok,
-                        float *snap) {
+                        float *snap, int write_state = 1, float *scratch = nullptr) {
     if (vd % 32 == 0 && (kd == 32 || kd == 64 || kd == 128 || kd == 256)) {
         const dim3 grid(value_heads, vd / 32);
+        const int w = write_state;
         switch (kd) {
-            case 32: gated_delta_reg_kernel<8><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
-            case 64: gated_delta_reg_kernel<16><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
-            case 128: gated_delta_reg_kernel<32><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
-            default: gated_delta_reg_kernel<64><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
+            case 32: gated_delta_reg_kernel<8><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap, w); break;
+            case 64: gated_delta_reg_kernel<16><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap, w); break;
+            case 128: gated_delta_reg_kernel<32><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap, w); break;
+            default: gated_delta_reg_kernel<64><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap, w); break;
         }
         return;
+    }
+    if (!write_state) {  // fallback kernel works in place: run it on a copy
+        cudaMemcpyAsync(scratch, st, static_cast<size_t>(value_heads) * kd * vd * sizeof(float), cudaMemcpyDeviceToDevice, 0);
+        st = scratch;
     }
     const int threads = vd < 32 ? 32 : ((vd + 31) / 32) * 32;
     gated_delta_kernel<<<value_heads, threads, 2 * kd * sizeof(float)>>>(conv, b, a, ssm_a, dt, st, o, key_heads,
@@ -1755,11 +1774,11 @@ PyObject *Runtime_argmax_rows(RuntimeObject *self, PyObject *args) {
     const char *xname;
     int n = 0, ntok = 1;
     if (!PyArg_ParseTuple(args, "sii", &xname, &n, &ntok)) return nullptr;
-    if (ntok < 1 || ntok > kMaxTokens) return PyErr_Format(PyExc_ValueError, "ntok must be in [1, %d]", kMaxTokens);
+    if (ntok < 1 || ntok > kMaxArgmaxRows) return PyErr_Format(PyExc_ValueError, "ntok must be in [1, %d]", kMaxArgmaxRows);
     const float *x = find_buffer(self, xname, static_cast<size_t>(n) * ntok);
     if (x == nullptr) return nullptr;
     argmax_kernel<<<ntok, 1024>>>(x, n, self->argmax_out);
-    int host[kMaxTokens];
+    int host[kMaxArgmaxRows];
     cudaError_t err = cudaGetLastError();
     if (err == cudaSuccess) err = cudaMemcpy(host, self->argmax_out, ntok * sizeof(int), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) return cuda_error("argmax_rows", err);
@@ -1932,11 +1951,12 @@ PyObject *Runtime_set_segments(RuntimeObject *self, PyObject *args) {
     int row0 = 0;
     const Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
     for (Py_ssize_t i = 0; i < n; ++i) {
-        int slot = 0, pos0 = 0, rows = 0;
-        if (!PyArg_ParseTuple(PySequence_Fast_GET_ITEM(seq, i), "iii", &slot, &pos0, &rows)) {
+        int slot = 0, pos0 = 0, rows = 0, r0 = -1;
+        if (!PyArg_ParseTuple(PySequence_Fast_GET_ITEM(seq, i), "iii|i", &slot, &pos0, &rows, &r0)) {
             Py_DECREF(seq);
             return nullptr;
         }
+        if (r0 >= 0) row0 = r0;  // explicit row offset (commit replays rows of an earlier pass)
         if (slot < 0 || slot >= self->max_slots || pos0 < 0 || rows < 1 ||
             pos0 + rows > self->page_size * self->pages_per_seq) {
             Py_DECREF(seq);
@@ -1950,9 +1970,11 @@ PyObject *Runtime_set_segments(RuntimeObject *self, PyObject *args) {
     return PyLong_FromLong(row0);
 }
 
-static int seg_rows(RuntimeObject *self) {
+static int seg_rows(RuntimeObject *self) {  // rows spanned by the segments (max row0 + rows)
     const auto &g = *self->seg;
-    return g[g.size() - 2] + g[g.size() - 1];
+    int n = 0;
+    for (size_t i = 0; i < g.size(); i += 4) n = g[i + 2] + g[i + 3] > n ? g[i + 2] + g[i + 3] : n;
+    return n;
 }
 
 static bool seg_ready(RuntimeObject *self) {
@@ -2050,9 +2072,11 @@ PyObject *Runtime_attention_seg(RuntimeObject *self, PyObject *args) {
 // ([slots][channels][K]); snapshots need a single segment.
 PyObject *Runtime_conv_update_seg(RuntimeObject *self, PyObject *args) {
     const char *xname, *sname, *wname, *oname, *snapname = nullptr;
-    int channels = 0, K = 0;
-    if (!PyArg_ParseTuple(args, "ssssii|z", &xname, &sname, &wname, &oname, &channels, &K, &snapname)) return nullptr;
+    int channels = 0, K = 0, write_state = 1;
+    if (!PyArg_ParseTuple(args, "ssssii|zi", &xname, &sname, &wname, &oname, &channels, &K, &snapname, &write_state))
+        return nullptr;
     if (!seg_ready(self)) return nullptr;
+    if (K > kConvMaxK) return PyErr_Format(PyExc_ValueError, "conv kernel size %d > %d", K, kConvMaxK);
     const int ntok = seg_rows(self);
     const size_t stride = static_cast<size_t>(channels) * K;
     const float *x = find_buffer(self, xname, static_cast<size_t>(channels) * ntok);
@@ -2070,7 +2094,8 @@ PyObject *Runtime_conv_update_seg(RuntimeObject *self, PyObject *args) {
     for (size_t i = 0; i < g.size(); i += 4) {
         const int slot = g[i], rows = g[i + 2], row0 = g[i + 3];
         conv_update_kernel<<<blocks_for(channels, 256), 256>>>(x + static_cast<size_t>(row0) * channels, st + slot * stride, w,
-                                                               o + static_cast<size_t>(row0) * channels, channels, K, rows, snap);
+                                                               o + static_cast<size_t>(row0) * channels, channels, K, rows, snap,
+                                                               write_state);
     }
     return launch_result("conv_update_seg");
 }
@@ -2079,10 +2104,10 @@ PyObject *Runtime_conv_update_seg(RuntimeObject *self, PyObject *args) {
 // per-segment gated delta over the slot's state ([slots][vh][kd][vd]).
 PyObject *Runtime_gated_delta_seg(RuntimeObject *self, PyObject *args) {
     const char *cname, *bname, *aname, *ssm_a_name, *dt_name, *sname, *oname, *snapname = nullptr;
-    int key_heads = 0, value_heads = 0, kd = 0, vd = 0, head_order = 0;
+    int key_heads = 0, value_heads = 0, kd = 0, vd = 0, head_order = 0, write_state = 1;
     float eps = 1e-6f;
-    if (!PyArg_ParseTuple(args, "sssssssiiiifi|z", &cname, &bname, &aname, &ssm_a_name, &dt_name, &sname, &oname,
-                          &key_heads, &value_heads, &kd, &vd, &eps, &head_order, &snapname))
+    if (!PyArg_ParseTuple(args, "sssssssiiiifi|zi", &cname, &bname, &aname, &ssm_a_name, &dt_name, &sname, &oname,
+                          &key_heads, &value_heads, &kd, &vd, &eps, &head_order, &snapname, &write_state))
         return nullptr;
     if (!seg_ready(self)) return nullptr;
     if (key_heads <= 0 || value_heads % key_heads != 0) return PyErr_Format(PyExc_ValueError, "value heads must be a multiple of key heads");
@@ -2104,12 +2129,13 @@ PyObject *Runtime_gated_delta_seg(RuntimeObject *self, PyObject *args) {
         snap = find_buffer(self, snapname, state_n * (ntok - 1));
         if (snap == nullptr) return nullptr;
     }
+    if (!write_state && !ensure_scratch(self, state_n, 0)) return cuda_error("gated_delta_seg scratch", cudaErrorMemoryAllocation);
     for (size_t i = 0; i < g.size(); i += 4) {
         const int slot = g[i], rows = g[i + 2], row0 = g[i + 3];
         launch_gated_delta(conv + row0 * conv_dim, b + static_cast<size_t>(row0) * value_heads,
                            a + static_cast<size_t>(row0) * value_heads, ssm_a, dt, st + slot * state_n,
                            o + static_cast<size_t>(row0) * value_heads * vd, key_heads, value_heads, kd, vd, eps,
-                           head_order, rows, snap);
+                           head_order, rows, snap, write_state, self->scratch_x);
     }
     return launch_result("gated_delta_seg");
 }

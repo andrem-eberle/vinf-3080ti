@@ -183,8 +183,12 @@ the whole server with `--no-think`. Decoding is greedy: `temperature` / `top_p` 
 Concurrent requests (several agents on the same port) are decoded together: one pass per step computes the
 next token of every generating request, so the weights cross PCIe once for all of them. `--max-seqs N`
 (default 4 with `--serve`) sets how many run at once; they share a KV cache pool of `--kv-pool-tokens`
-(default `--max-context`). A lone request uses MTP speculation; when the pool runs out, the newest request is
+(default `--max-context`). Every request keeps MTP speculation inside the shared pass; when the pool runs out,
+the newest request is
 swapped to host RAM and resumes later. Each request's output is identical to running it alone.
+
+Total throughput with concurrent requests (Qwen3.8-27B UD-Q3_K_XL, `--max-context 32768`, 100 new tokens each,
+including prompt processing): 1 request 8.6 tok/s, 2 requests 13.2 tok/s, 4 requests 18.1 tok/s.
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
@@ -233,7 +237,6 @@ Working: single-sequence greedy decoding of Qwen3.8-27B GGUF models on the RTX 3
 served from the CLI or an OpenAI-compatible HTTP API.
 Next:
 
-- Speculative decoding for every sequence inside multi-sequence passes
 - Temperature / top-k / top-p sampling with lossless speculative sampling
 - Smaller DFlash 2 draft footprint (4-bit draft weights, cheaper SSM snapshots)
 - Multi-token passes inside the fused megakernel

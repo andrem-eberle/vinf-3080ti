@@ -262,11 +262,14 @@ class QwenGpuExecutor:
         pool = max_context if kv_pool_tokens is None else max(kv_pool_tokens, self.page_size)
         self.kv_pages = -(-pool // self.page_size)
         self.reclaim = None  # optional callback(pages_needed) -> bool that frees idle sequences
+        # Rows of a verification pass: every sequence's next input plus its drafts.
+        self.verify_rows = max(max_batch, max_seqs * snapshot_tokens)
         # Rows per prompt-processing pass: each streamed weight crosses PCIe once per pass, so wide passes
         # make prefill compute-bound instead of PCIe-bound. DFlash feature capture keeps max_batch rows.
         self.prefill_batch = max(max_batch, prefill_batch) if not capture_layers else max_batch
         self.snapshot_tokens = snapshot_tokens
         self.last_ntok = 0
+        self._verify: list[tuple] = []  # (sequence, first row, rows) of the last verification pass
         self.schedule = qwen_layer_schedule(gguf, metadata)
         self.mtp_layer = qwen_mtp_layer_index(gguf, metadata) if mtp else None
         self.mtp_concat = "eh"  # eh_proj input order: [enorm(embedding), hnorm(hidden)]
@@ -322,7 +325,7 @@ class QwenGpuExecutor:
         self.prefill_batch = 256
         self.kv_dtype = "f16"
         self.max_seqs, self.page_size, self.pages_per_seq = 1, max_context, 1
-        self.kv_pages = 1
+        self.kv_pages, self.verify_rows = 1, 8
         self.mtp_layer = None
         self.placement, self.cpu_layers, self.cpu = "stream", frozenset(), None
         self.capture_layers, self.reserve_extra_bytes = (), 0
@@ -414,10 +417,19 @@ class QwenGpuExecutor:
         if self.capture_layers:
             specs["cap_feat"] = len(self.capture_layers) * s.hidden
         specs = {name: n * self.prefill_batch for name, n in specs.items()}
-        specs["logits"] = s.vocab * self.max_batch  # LM head rows: verification / multi-sequence passes only
+        specs["logits"] = s.vocab * self.verify_rows  # LM head rows: verification / multi-sequence passes only
         if "spec_pend" in specs:  # MTP rows pending per sequence slot
             specs["spec_pend"] = s.hidden * self.max_batch * self.max_seqs
         specs["page_table"] = self.max_seqs * self.pages_per_seq
+        if self.snapshot_tokens > 0:
+            # Inputs of the SSM layers in a verification pass (conv input, conv output, beta, alpha rows):
+            # rollback replays the accepted rows from the untouched state.
+            for i, kind in enumerate(self.schedule):
+                if kind is QwenLayerKind.LINEAR_ATTENTION:
+                    specs[f"hq.{i}"] = s.conv_dim * self.verify_rows
+                    specs[f"hc.{i}"] = s.conv_dim * self.verify_rows
+                    specs[f"hb.{i}"] = s.value_heads * self.verify_rows
+                    specs[f"ha.{i}"] = s.value_heads * self.verify_rows
         specs["h_last"] = s.hidden
         return specs
 
@@ -434,9 +446,9 @@ class QwenGpuExecutor:
                 ssm = s.value_heads * s.key_head_dim * s.value_head_dim
                 specs[f"conv.{layer_idx}"] = conv * self.max_seqs
                 specs[f"ssm.{layer_idx}"] = ssm * self.max_seqs
-                if self.snapshot_tokens > 1:
-                    # States after tokens 0..n-2 of a multi-token pass (the last token's state is live),
-                    # for rollback to any accepted position.
+                if self.snapshot_tokens > 1 and layer_idx in self.cpu_layers:
+                    # CPU layers: states after tokens 0..n-2 of a verification pass, for rollback. GPU layers
+                    # keep the pass inputs instead and replay the accepted rows (see commit).
                     specs[f"conv_snap.{layer_idx}"] = conv * (self.snapshot_tokens - 1)
                     specs[f"ssm_snap.{layer_idx}"] = ssm * (self.snapshot_tokens - 1)
         if self.mtp_layer is not None:
@@ -699,10 +711,18 @@ class QwenGpuExecutor:
         ssm_snap = f"ssm_snap.{layer_idx}" if snapshot else None
         gd = ("lin_conv", "lin_beta", "lin_alpha", p + "ssm_a", p + "ssm_dt.bias", f"ssm.{layer_idx}", "lin_core",
               s.key_heads, s.value_heads, s.key_head_dim, s.value_head_dim, s.eps, self.head_order)
-        if rt is self.rt:  # state slot per segment
+        if rt is self.rt and snapshot:  # verification: state untouched, inputs kept for the commit replay
             rt.conv_update_seg("lin_qkv", f"conv.{layer_idx}", p + "ssm_conv1d.weight", "lin_conv", s.conv_dim,
-                               s.conv_kernel, conv_snap)
-            rt.gated_delta_seg(*gd, ssm_snap)
+                               s.conv_kernel, None, 0)
+            rt.gated_delta_seg(*gd, None, 0)
+            rt.copy(f"hq.{layer_idx}", 0, "lin_qkv", 0, n * s.conv_dim)
+            rt.copy(f"hc.{layer_idx}", 0, "lin_conv", 0, n * s.conv_dim)
+            rt.copy(f"hb.{layer_idx}", 0, "lin_beta", 0, n * s.value_heads)
+            rt.copy(f"ha.{layer_idx}", 0, "lin_alpha", 0, n * s.value_heads)
+        elif rt is self.rt:  # state slot per segment
+            rt.conv_update_seg("lin_qkv", f"conv.{layer_idx}", p + "ssm_conv1d.weight", "lin_conv", s.conv_dim,
+                               s.conv_kernel)
+            rt.gated_delta_seg(*gd)
         else:
             rt.conv_update("lin_qkv", f"conv.{layer_idx}", p + "ssm_conv1d.weight", "lin_conv", s.conv_dim,
                            s.conv_kernel, n, conv_snap)
@@ -735,8 +755,71 @@ class QwenGpuExecutor:
         self.ensure_pages(seq, seq.position + n)
         self.rt.set_segments([(seq.slot, seq.position, n)])
         self._forward_rows(list(token_ids), self.position, snapshot)
+        self._verify = [(seq, 0, n)] if snapshot else []
         seq.tokens.extend(token_ids)
         self.last_ntok = n
+
+    def forward_verify(self, seqs: list[Sequence], rows: list[list[int]]) -> None:
+        """Verification pass for several sequences at once: rows[i] = sequence i's next input followed by
+        its drafts. SSM/conv state is left untouched until commit(); KV is appended for every row.
+        greedy_rows() then gives every row's target (rows of sequence i are contiguous, in order)."""
+        n = sum(len(r) for r in rows)
+        if not seqs or len(seqs) != len(rows) or any(not r for r in rows):
+            raise ConfigurationError("forward_verify needs one non-empty row list per sequence")
+        if n > self.verify_rows or any(len(r) > self.snapshot_tokens for r in rows):
+            raise ConfigurationError(f"verification pass of {n} rows exceeds verify_rows={self.verify_rows} "
+                                     f"or snapshot_tokens={self.snapshot_tokens} per sequence")
+        if self.cpu_layers and len(seqs) > 1:
+            raise ConfigurationError("CPU layers run a single sequence")
+        for seq, r in zip(seqs, rows):
+            self.ensure_pages(seq, seq.position + len(r))
+        segs, verify, row0 = [], [], 0
+        for seq, r in zip(seqs, rows):
+            segs.append((seq.slot, seq.position, len(r)))
+            verify.append((seq, row0, len(r)))
+            row0 += len(r)
+        self.rt.set_segments(segs)
+        flat = [t for r in rows for t in r]
+        self._forward_rows(flat, seqs[0].position, True)
+        for seq, r in zip(seqs, rows):
+            seq.tokens.extend(r)
+        self._verify = verify
+        self.last_ntok = n
+
+    def commit(self, keeps: list[int]) -> None:
+        """After a verification pass, keep the first keeps[i] rows of sequence i: advance its SSM/conv state
+        by replaying those rows from the stored pass inputs, and drop the rest (KV rows past the kept
+        positions are ignored and later overwritten)."""
+        if len(keeps) != len(self._verify):
+            raise ConfigurationError("commit needs one keep count per sequence of the last verification pass")
+        for (seq, row0, n), keep in zip(self._verify, keeps):
+            if not 1 <= keep <= n:
+                raise ConfigurationError(f"keep must be in [1, {n}]")
+        s = self.shapes
+        gpu_linear = [i for i, k in enumerate(self.schedule)
+                      if k is QwenLayerKind.LINEAR_ATTENTION and i not in self.cpu_layers]
+        if gpu_linear:
+            self.rt.set_segments([(seq.slot, seq.position, keep, row0)
+                                  for (seq, row0, _), keep in zip(self._verify, keeps)])
+            for i in gpu_linear:
+                p = f"blk.{i}."
+                self.rt.conv_update_seg(f"hq.{i}", f"conv.{i}", p + "ssm_conv1d.weight", "lin_conv", s.conv_dim,
+                                        s.conv_kernel)
+                self.rt.gated_delta_seg(f"hc.{i}", f"hb.{i}", f"ha.{i}", p + "ssm_a", p + "ssm_dt.bias", f"ssm.{i}",
+                                        "lin_core", s.key_heads, s.value_heads, s.key_head_dim, s.value_head_dim,
+                                        s.eps, self.head_order)
+        if self.cpu_layers:  # single sequence: restore the CPU layers' snapshots
+            (seq, _, n), keep = self._verify[0], keeps[0]
+            conv = s.conv_dim * s.conv_kernel
+            ssm = s.value_heads * s.key_head_dim * s.value_head_dim
+            if keep < n:
+                for i in sorted(self.cpu_layers):
+                    if self.schedule[i] is QwenLayerKind.LINEAR_ATTENTION:
+                        self.cpu.copy(f"conv.{i}", 0, f"conv_snap.{i}", (keep - 1) * conv, conv)
+                        self.cpu.copy(f"ssm.{i}", 0, f"ssm_snap.{i}", (keep - 1) * ssm, ssm)
+        for (seq, _, n), keep in zip(self._verify, keeps):
+            del seq.tokens[len(seq.tokens) - (n - keep):]
+        self._verify = []
 
     def forward_multi(self, seqs: list[Sequence], token_ids: list[int]) -> None:
         """One pass over one new token for each sequence (reading every weight once for all of them).
@@ -793,24 +876,11 @@ class QwenGpuExecutor:
         self.forward_tokens([token_id])
 
     def rollback(self, keep: int) -> None:
-        """After a snapshot multi-token pass of n tokens, keep only the first `keep` (1..n): rewind the
-        position (attention KV beyond it is ignored) and restore SSM/conv state after token keep-1."""
-        n = self.last_ntok
-        if not 1 <= keep <= n:
-            raise ConfigurationError(f"keep must be in [1, {n}]")
-        if keep == n:
-            return
-        s = self.shapes
-        conv = s.conv_dim * s.conv_kernel
-        ssm = s.value_heads * s.key_head_dim * s.value_head_dim
-        slot = self.seq.slot
-        for layer_idx, kind in enumerate(self.schedule):
-            if kind is QwenLayerKind.LINEAR_ATTENTION:
-                rt = self._rt(layer_idx)
-                k = slot if rt is self.rt else 0
-                rt.copy(f"conv.{layer_idx}", k * conv, f"conv_snap.{layer_idx}", (keep - 1) * conv, conv)
-                rt.copy(f"ssm.{layer_idx}", k * ssm, f"ssm_snap.{layer_idx}", (keep - 1) * ssm, ssm)
-        del self.seq.tokens[len(self.seq.tokens) - (n - keep):]
+        """After a verification pass of n tokens (forward_tokens(..., snapshot=True)), keep only the first
+        `keep` (1..n)."""
+        if not self._verify:
+            raise ConfigurationError("rollback needs a preceding verification pass")
+        self.commit([keep])
         self.last_ntok = keep
 
     def _lm_head(self) -> None:
