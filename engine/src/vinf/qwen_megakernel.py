@@ -383,7 +383,10 @@ class QwenMegakernelExecutor:
             raise UnsupportedModelError("the megakernel reads fp32 KV caches; create the executor with kv_dtype='f32'")
         if base.head_order != HEAD_ORDERS["tiled"]:
             raise UnsupportedModelError("the megakernel implements the tiled SSM value-head order only")
+        if base.max_seqs != 1 or base.page_size != base.max_context:
+            raise UnsupportedModelError("the megakernel needs one sequence with a single KV page (page_size = max_context)")
         self.base = base
+        base.ensure_pages(base.seq, base.max_context)  # one page = the contiguous cache layout the megakernel reads
         self.mk = _load_module().Megakernel(_iq3_s_grid_bytes())
         info = self.mk.device_info()
         if not info["cooperative"]:
@@ -464,7 +467,7 @@ class QwenMegakernelExecutor:
         if error:
             reason = "dependency wait timed out" if error == 1 else "invalid opcode"
             raise DecodeError(f"megakernel aborted ({reason}) at SM {block}, queue entry {instr}")
-        base.position += 1
+        base.seq.tokens.append(token_id)
         return token
 
     def logits(self) -> list[float]:

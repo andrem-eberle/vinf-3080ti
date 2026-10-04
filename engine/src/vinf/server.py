@@ -6,7 +6,8 @@ Endpoints (the /v1 prefix is optional):
   POST /v1/chat/completions    chat (the model's GGUF chat template) with tool calling, streaming via server-sent events
   POST /v1/completions         raw text completion, streaming via server-sent events
 
-One model instance serves one generation at a time; concurrent requests wait in line.
+Concurrent requests are decoded together by the continuous-batching scheduler (vinf.scheduler) when the
+backend supports it (--max-seqs > 1); otherwise they wait in line.
 Sampling parameters are accepted and decoded greedily (the engine is greedy-only for now) unless
 the server runs with --strict-sampling, which rejects them.
 """
@@ -352,16 +353,34 @@ class OpenAIService:
             for field, text in deltas:
                 on_delta(field, text)
 
-        if self.lock.locked():
-            self.log("request queued behind the running generation")
-        with self.lock:
+        if hasattr(self.backend, "submit"):  # scheduler: runs alongside other requests
             times["start"] = time.perf_counter()
+            job = self.backend.submit(prompt, max_new)
             self.log(f"request: {len(prompt)} prompt tokens, up to {max_new} new tokens "
-                     f"(prompt processing ~{len(prompt) / 25:.0f}s at ~25 tok/s)")
+                     f"({self.backend.scheduler().active()} active)")
+            tokens = None
             try:
-                tokens, _ = self.backend.generate(prompt, max_new, on_token=on_token)
+                for kind, value in job:
+                    if kind == "token":
+                        on_token(value)
+                tokens = job.out
             except _Cancelled:
-                tokens = None
+                job.cancel()
+            except BaseException:
+                job.cancel()
+                raise
+            if job.cached_tokens:
+                self.log(f"prefix cache: reused {job.cached_tokens} of {len(prompt)} prompt tokens")
+        else:
+            if self.lock.locked():
+                self.log("request queued behind the running generation")
+            with self.lock:
+                times["start"] = time.perf_counter()
+                self.log(f"request: {len(prompt)} prompt tokens, up to {max_new} new tokens")
+                try:
+                    tokens, _ = self.backend.generate(prompt, max_new, on_token=on_token)
+                except _Cancelled:
+                    tokens = None
         if ts.finish_reason is None:
             for field, text in ts._flush():
                 on_delta(field, text)

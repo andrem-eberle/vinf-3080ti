@@ -180,7 +180,11 @@ Thinking is on by default as in Qwen (the reasoning is returned in `reasoning_co
 request with `"reasoning_effort": "none"` or `"chat_template_kwargs": {"enable_thinking": false}`, or for
 the whole server with `--no-think`. Decoding is greedy: `temperature` / `top_p` are accepted and ignored
 (`--strict-sampling` rejects them instead). `--api-key KEY` requires `Authorization: Bearer KEY`.
-Requests are served one at a time.
+Concurrent requests (several agents on the same port) are decoded together: one pass per step computes the
+next token of every generating request, so the weights cross PCIe once for all of them. `--max-seqs N`
+(default 4 with `--serve`) sets how many run at once; they share a KV cache pool of `--kv-pool-tokens`
+(default `--max-context`). A lone request uses MTP speculation; when the pool runs out, the newest request is
+swapped to host RAM and resumes later. Each request's output is identical to running it alone.
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
@@ -229,7 +233,7 @@ Working: single-sequence greedy decoding of Qwen3.8-27B GGUF models on the RTX 3
 served from the CLI or an OpenAI-compatible HTTP API.
 Next:
 
-- Concurrent multi-agent decoding (many sequences per pass for higher total throughput)
+- Speculative decoding for every sequence inside multi-sequence passes
 - Temperature / top-k / top-p sampling with lossless speculative sampling
 - Smaller DFlash 2 draft footprint (4-bit draft weights, cheaper SSM snapshots)
 - Multi-token passes inside the fused megakernel

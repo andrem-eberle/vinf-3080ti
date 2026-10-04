@@ -39,11 +39,30 @@ class QwenBackend:
         if tokenizer.special_tokens.im_end_id is not None:
             ids.add(tokenizer.special_tokens.im_end_id)
         self.stop_token_ids = frozenset(ids)
+        self._scheduler = None
         self.prefix_cache = None
         if prefix_cache_bytes > 0 and self._prefix_cache_supported():
             from vinf.prefix_cache import PrefixCache
 
             self.prefix_cache = PrefixCache(self.base, max_bytes=prefix_cache_bytes)
+
+    def scheduler(self, log=print):
+        """Continuous-batching scheduler for concurrent requests (per-op executor only)."""
+        if self.executor is not self.base:
+            raise ConfigurationError("concurrent requests need the per-op executor")
+        if self._scheduler is None:
+            from vinf.scheduler import Scheduler
+
+            self._scheduler = Scheduler(self, log=log)
+        return self._scheduler
+
+    def submit(self, prompt_tokens: list[int], max_new_tokens: int):
+        """Queue a generation on the scheduler; returns a Job (iterate it for ("token", id) / ("done", reason))."""
+        return self.scheduler().submit(prompt_tokens, max_new_tokens)
+
+    @property
+    def concurrent(self) -> bool:
+        return self.executor is self.base and getattr(self.base, "max_seqs", 1) > 1
 
     def _prefix_cache_supported(self) -> bool:
         """Per-op executor, plain greedy or MTP speculation (DFlash keeps drafter context of its own)."""
@@ -99,6 +118,9 @@ class QwenBackend:
         if args.executor == "megakernel" and speculative > 0:
             log("note: --speculative runs on the per-op executor; megakernel decodes without speculation")
             speculative = 0
+        max_seqs = getattr(args, "max_seqs", None) or (4 if getattr(args, "serve", False) else 1)
+        if args.executor == "megakernel" or args.placement == "hybrid":
+            max_seqs = 1
         dflash_ck = None
         if speculative > 0 and args.drafter == "dflash":
             from vinf.dflash import DFlashCheckpoint
@@ -125,9 +147,15 @@ class QwenBackend:
             max_batch=max(8, speculative + 1),
             prefill_batch=args.prefill_batch,
             kv_dtype="f32" if args.executor == "megakernel" else args.kv_dtype,
+            max_seqs=1 if dflash_ck is not None else max_seqs,
+            kv_pool_tokens=getattr(args, "kv_pool_tokens", None),
+            page_size=args.max_context if args.executor == "megakernel" else 256,
             progress=progress,
         )
         log(executor.report())
+        if executor.max_seqs > 1:
+            log(f"concurrency: {executor.max_seqs} sequences sharing a KV pool of "
+                f"{executor.kv_pages * executor.page_size} tokens ({executor.kv_pages} pages of {executor.page_size})")
         log(f"load time {time.perf_counter() - t0:.1f}s; device weights {executor.rt.device_bytes() / 1024**3:.2f} GiB, "
             f"pinned host {executor.rt.pinned_bytes() / 1024**3:.2f} GiB")
         name = getattr(args, "served_model_name", None) or str(gguf.metadata_value("general.name") or Path(args.model).stem)

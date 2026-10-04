@@ -97,14 +97,29 @@ __device__ __forceinline__ float kv_load(const __half *p) { return __half2float(
 __device__ __forceinline__ void kv_store(float *p, float v) { *p = v; }
 __device__ __forceinline__ void kv_store(__half *p, float v) { *p = __float2half_rn(v); }
 
-// KV cache layout: [kv_head][max_seq][hd].
+// KV cache addressing. Contiguous (pt == nullptr): [kv_head][max_seq][hd]. Paged: a pool of pages
+// [page][kv_head][page_size][hd]; pt is the sequence's page table (pt[pos / page_size] = page id).
+struct KvAddr {
+    const int *pt;
+    int max_seq;
+    int page;
+    int kv_heads;
+    __device__ __forceinline__ size_t row(int kvh, int pos) const {
+        if (pt == nullptr) return static_cast<size_t>(kvh) * max_seq + pos;
+        const int pg = pt[pos / page];
+        return (static_cast<size_t>(pg) * kv_heads + kvh) * page + pos % page;
+    }
+};
+
+inline KvAddr contiguous_kv(int max_seq) { return KvAddr{nullptr, max_seq, 0, 0}; }
+
 template <typename T>
 __global__ void kv_append_kernel(const float *k, const float *v, T *kc, T *vc, int ntok, int kv_heads,
-                                 int max_seq, int hd, int pos0) {
+                                 KvAddr A, int hd, int pos0) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= ntok * kv_heads * hd) return;
     const int t = i / (kv_heads * hd), h = (i / hd) % kv_heads, d = i % hd;
-    const size_t dst = (static_cast<size_t>(h) * max_seq + pos0 + t) * hd + d;
+    const size_t dst = A.row(h, pos0 + t) * hd + d;
     kv_store(kc + dst, k[i]);
     kv_store(vc + dst, v[i]);
 }
@@ -115,7 +130,7 @@ __global__ void kv_append_kernel(const float *k, const float *v, T *kc, T *vc, i
 // grid = (heads, ntok); dynamic smem = (seq_len0 + ntok - 1) floats.
 template <typename T>
 __global__ void attention_kernel(const float *q, const T *kc, const T *vc, float *out, int heads, int kv_heads,
-                                 int hd, int max_seq, int seq_len0, float scale, int bidirectional, int window) {
+                                 int hd, KvAddr A, int seq_len0, float scale, int bidirectional, int window) {
     extern __shared__ float probs_all[];
     const int h = blockIdx.x, t = blockIdx.y;
     const int seq_len = bidirectional ? seq_len0 + static_cast<int>(gridDim.y) - 1 : seq_len0 + t;
@@ -124,11 +139,9 @@ __global__ void attention_kernel(const float *q, const T *kc, const T *vc, float
     float *probs = probs_all - start;  // index by absolute position
     const int kvh = h / (heads / kv_heads);
     const float *qh = q + (static_cast<size_t>(t) * heads + h) * hd;
-    const T *kbase = kc + static_cast<size_t>(kvh) * max_seq * hd;
-    const T *vbase = vc + static_cast<size_t>(kvh) * max_seq * hd;
     float local_max = -INFINITY;
     for (int p = start + threadIdx.x; p < seq_len; p += blockDim.x) {
-        const T *kp = kbase + static_cast<size_t>(p) * hd;
+        const T *kp = kc + A.row(kvh, p) * hd;
         float dot = 0.0f;
         for (int d = 0; d < hd; ++d) dot += qh[d] * kv_load(kp + d);
         probs[p] = dot * scale;
@@ -144,7 +157,7 @@ __global__ void attention_kernel(const float *q, const T *kc, const T *vc, float
     float *o = out + (static_cast<size_t>(t) * heads + h) * hd;
     for (int d = threadIdx.x; d < hd; d += blockDim.x) {
         float acc = 0.0f;
-        for (int p = start; p < seq_len; ++p) acc += probs[p] * kv_load(vbase + static_cast<size_t>(p) * hd + d);
+        for (int p = start; p < seq_len; ++p) acc += probs[p] * kv_load(vc + A.row(kvh, p) * hd + d);
         o[d] = acc / denom;
     }
 }
@@ -164,7 +177,7 @@ __host__ __device__ constexpr size_t attn_tiled_smem(int hd) {
 
 template <typename T>
 __global__ void attention_tiled_kernel(const float *q, const T *kc, const T *vc, float *out, int heads,
-                                       int kv_heads, int hd, int max_seq, int seq_len0, int ntok, float scale,
+                                       int kv_heads, int hd, KvAddr A, int seq_len0, int ntok, float scale,
                                        int bidirectional, int window) {
     extern __shared__ float smem[];
     const int ld = hd + 1;
@@ -178,8 +191,6 @@ __global__ void attention_tiled_kernel(const float *q, const T *kc, const T *vc,
     const int h = blockIdx.x, t0 = blockIdx.y * kAttnTQ, tid = threadIdx.x, nthr = blockDim.x;
     const int nq = min(kAttnTQ, ntok - t0);
     const int kvh = h / (heads / kv_heads);
-    const T *kbase = kc + static_cast<size_t>(kvh) * max_seq * hd;
-    const T *vbase = vc + static_cast<size_t>(kvh) * max_seq * hd;
     for (int i = tid; i < kAttnTQ * hd; i += nthr) {
         const int r = i / hd, d = i % hd;
         qs[r * ld + d] = r < nq ? q[(static_cast<size_t>(t0 + r) * heads + h) * hd + d] * scale : 0.0f;
@@ -204,8 +215,8 @@ __global__ void attention_tiled_kernel(const float *q, const T *kc, const T *vc,
         for (int i = tid; i < kAttnTK * hd; i += nthr) {
             const int r = i / hd, d = i % hd;
             const bool in = r < nk;
-            ks[r * ld + d] = in ? kv_load(kbase + static_cast<size_t>(k0 + r) * hd + d) : 0.0f;
-            vs[r * ld + d] = in ? kv_load(vbase + static_cast<size_t>(k0 + r) * hd + d) : 0.0f;
+            ks[r * ld + d] = in ? kv_load(kc + A.row(kvh, k0 + r) * hd + d) : 0.0f;
+            vs[r * ld + d] = in ? kv_load(vc + A.row(kvh, k0 + r) * hd + d) : 0.0f;
         }
         __syncthreads();
         for (int i = tid; i < kAttnTQ * kAttnTK; i += nthr) {
@@ -272,7 +283,7 @@ __host__ __device__ constexpr size_t attn_tc_smem(int hd) {
 
 template <typename T>
 __global__ void __launch_bounds__(32 * kTcWarps) attention_tc_kernel(
-    const float *q, const T *kc, const T *vc, float *out, int heads, int kv_heads, int hd, int max_seq, int seq_len0,
+    const float *q, const T *kc, const T *vc, float *out, int heads, int kv_heads, int hd, KvAddr A, int seq_len0,
     int ntok, float scale, int bidirectional, int window) {
     using namespace nvcuda;
     extern __shared__ __align__(32) unsigned char tc_smem[];
@@ -286,8 +297,6 @@ __global__ void __launch_bounds__(32 * kTcWarps) attention_tc_kernel(
     const int h = blockIdx.x, t0 = blockIdx.y * kTcQ, tid = threadIdx.x, nthr = blockDim.x, warp = tid / 32;
     const int nq = min(kTcQ, ntok - t0);
     const int kvh = h / (heads / kv_heads);
-    const T *kbase = kc + static_cast<size_t>(kvh) * max_seq * hd;
-    const T *vbase = vc + static_cast<size_t>(kvh) * max_seq * hd;
     for (int i = tid; i < kTcQ * hd; i += nthr) {
         const int r = i / hd, d = i % hd;
         qs[r * ldh + d] = __float2half_rn(r < nq ? q[(static_cast<size_t>(t0 + r) * heads + h) * hd + d] * scale : 0.0f);
@@ -308,7 +317,7 @@ __global__ void __launch_bounds__(32 * kTcWarps) attention_tc_kernel(
         const int nk = min(kTcK, kend - k0);
         for (int i = tid; i < kTcK * hd; i += nthr) {
             const int r = i / hd, d = i % hd;
-            kvs[r * ldh + d] = __float2half_rn(r < nk ? kv_load(kbase + static_cast<size_t>(k0 + r) * hd + d) : 0.0f);
+            kvs[r * ldh + d] = __float2half_rn(r < nk ? kv_load(kc + A.row(kvh, k0 + r) * hd + d) : 0.0f);
         }
         __syncthreads();
         {  // S = Q K^T: 2 x 2 fragments of 16 x 16, one per warp
@@ -328,7 +337,7 @@ __global__ void __launch_bounds__(32 * kTcWarps) attention_tc_kernel(
         // V tile replaces K; the softmax update runs alongside.
         for (int i = tid; i < kTcK * hd; i += nthr) {
             const int r = i / hd, d = i % hd;
-            kvs[r * ldh + d] = __float2half_rn(r < nk ? kv_load(vbase + static_cast<size_t>(k0 + r) * hd + d) : 0.0f);
+            kvs[r * ldh + d] = __float2half_rn(r < nk ? kv_load(vc + A.row(kvh, k0 + r) * hd + d) : 0.0f);
         }
         if (tid < kTcQ) {
             const int r = tid;
@@ -922,6 +931,12 @@ struct RuntimeObject {
     __half *gemm_x;  // fp16 activations for the tensor-core GEMM, [ntok rounded to kGemmBN][cols]
     size_t gemm_x_len;
     int gemm_min_rows;  // prompt-pass kernels (GEMM, tiled attention) from this many rows (0 = more than kMaxTokens)
+    // Multi-sequence passes: the rows of a pass are segments of consecutive positions of one sequence slot.
+    std::vector<int> *seg;  // [slot, pos0, rows, row0] per segment
+    const int *page_table;  // device [slots][pages_per_seq] page ids (int32 stored in a float buffer)
+    int page_size;
+    int pages_per_seq;
+    int max_slots;
 };
 
 PyObject *cuda_error(const char *context, cudaError_t err) {
@@ -1142,6 +1157,8 @@ void Runtime_dealloc(RuntimeObject *self) {
     cudaFree(self->scratch_x);
     cudaFree(self->scratch_y);
     cudaFree(self->gemm_x);
+    delete self->seg;
+    self->seg = nullptr;
     Py_TYPE(self)->tp_free(reinterpret_cast<PyObject *>(self));
 }
 
@@ -1579,16 +1596,16 @@ PyObject *Runtime_kv_append(RuntimeObject *self, PyObject *args) {
     if (ke != ve) return PyErr_Format(PyExc_TypeError, "K and V caches differ in precision");
     if (ke == 2)
         kv_append_kernel<__half><<<blocks_for(n, 256), 256>>>(k, v, static_cast<__half *>(kc), static_cast<__half *>(vc),
-                                                              ntok, kv_heads, max_seq, hd, pos);
+                                                              ntok, kv_heads, contiguous_kv(max_seq), hd, pos);
     else
         kv_append_kernel<float><<<blocks_for(n, 256), 256>>>(k, v, static_cast<float *>(kc), static_cast<float *>(vc),
-                                                             ntok, kv_heads, max_seq, hd, pos);
+                                                             ntok, kv_heads, contiguous_kv(max_seq), hd, pos);
     return launch_result("kv_append");
 }
 
 template <typename T>
 PyObject *launch_attention(const T *kc, const T *vc, const float *q, float *o, int heads, int kv_heads, int hd,
-                           int max_seq, int seq_len, int ntok, int bidirectional, int window, bool prompt_pass) {
+                           KvAddr A, int seq_len, int ntok, int bidirectional, int window, bool prompt_pass) {
     const size_t smem = static_cast<size_t>(seq_len + ntok - 1) * sizeof(float);
     const float scale = 1.0f / sqrtf(static_cast<float>(hd));
     if ((ntok > kMaxTokens || prompt_pass) && hd % 16 == 0 && attn_tc_smem(hd) <= 99 * 1024) {
@@ -1601,7 +1618,7 @@ PyObject *launch_attention(const T *kc, const T *vc, const float *q, float *o, i
             tc_attr = csmem;
         }
         attention_tc_kernel<T><<<dim3(heads, (ntok + kTcQ - 1) / kTcQ), 32 * kTcWarps, csmem>>>(
-            q, kc, vc, o, heads, kv_heads, hd, max_seq, seq_len, ntok, scale, bidirectional, window);
+            q, kc, vc, o, heads, kv_heads, hd, A, seq_len, ntok, scale, bidirectional, window);
         return launch_result("attention");
     }
     if (ntok > kMaxTokens || smem > 32 * 1024 || prompt_pass) {
@@ -1615,14 +1632,14 @@ PyObject *launch_attention(const T *kc, const T *vc, const float *q, float *o, i
             tiled_attr = tsmem;
         }
         attention_tiled_kernel<T><<<dim3(heads, (ntok + kAttnTQ - 1) / kAttnTQ), hd, tsmem>>>(
-            q, kc, vc, o, heads, kv_heads, hd, max_seq, seq_len, ntok, scale, bidirectional, window);
+            q, kc, vc, o, heads, kv_heads, hd, A, seq_len, ntok, scale, bidirectional, window);
         return launch_result("attention");
     }
     if (smem > 48 * 1024) {
         cudaError_t err = cudaFuncSetAttribute(attention_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
         if (err != cudaSuccess) return cuda_error("attention smem attribute", err);
     }
-    attention_kernel<T><<<dim3(heads, ntok), 256, smem>>>(q, kc, vc, o, heads, kv_heads, hd, max_seq, seq_len, scale,
+    attention_kernel<T><<<dim3(heads, ntok), 256, smem>>>(q, kc, vc, o, heads, kv_heads, hd, A, seq_len, scale,
                                                           bidirectional, window);
     return launch_result("attention");
 }
@@ -1648,9 +1665,9 @@ PyObject *Runtime_attention(RuntimeObject *self, PyObject *args) {
     const bool prompt_pass = self->gemm_min_rows > 0 && ntok >= self->gemm_min_rows;
     if (ke == 2)
         return launch_attention(static_cast<const __half *>(kc), static_cast<const __half *>(vc), q, o, heads, kv_heads, hd,
-                                max_seq, seq_len, ntok, bidirectional, window, prompt_pass);
+                                contiguous_kv(max_seq), seq_len, ntok, bidirectional, window, prompt_pass);
     return launch_attention(static_cast<const float *>(kc), static_cast<const float *>(vc), q, o, heads, kv_heads, hd,
-                            max_seq, seq_len, ntok, bidirectional, window, prompt_pass);
+                            contiguous_kv(max_seq), seq_len, ntok, bidirectional, window, prompt_pass);
 }
 
 PyObject *Runtime_conv_update(RuntimeObject *self, PyObject *args) {
@@ -1671,6 +1688,24 @@ PyObject *Runtime_conv_update(RuntimeObject *self, PyObject *args) {
     }
     conv_update_kernel<<<blocks_for(channels, 256), 256>>>(x, st, w, o, channels, K, ntok, snap);
     return launch_result("conv_update");
+}
+
+void launch_gated_delta(const float *conv, const float *b, const float *a, const float *ssm_a, const float *dt, float *st,
+                        float *o, int key_heads, int value_heads, int kd, int vd, float eps, int head_order, int ntok,
+                        float *snap) {
+    if (vd % 32 == 0 && (kd == 32 || kd == 64 || kd == 128 || kd == 256)) {
+        const dim3 grid(value_heads, vd / 32);
+        switch (kd) {
+            case 32: gated_delta_reg_kernel<8><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
+            case 64: gated_delta_reg_kernel<16><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
+            case 128: gated_delta_reg_kernel<32><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
+            default: gated_delta_reg_kernel<64><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
+        }
+        return;
+    }
+    const int threads = vd < 32 ? 32 : ((vd + 31) / 32) * 32;
+    gated_delta_kernel<<<value_heads, threads, 2 * kd * sizeof(float)>>>(conv, b, a, ssm_a, dt, st, o, key_heads,
+                                                                         value_heads, kd, vd, eps, head_order, ntok, snap);
 }
 
 PyObject *Runtime_gated_delta(RuntimeObject *self, PyObject *args) {
@@ -1697,19 +1732,7 @@ PyObject *Runtime_gated_delta(RuntimeObject *self, PyObject *args) {
         snap = find_buffer(self, snapname, state_n * (ntok - 1));
         if (snap == nullptr) return nullptr;
     }
-    if (vd % 32 == 0 && (kd == 32 || kd == 64 || kd == 128 || kd == 256)) {
-        const dim3 grid(value_heads, vd / 32);
-        switch (kd) {
-            case 32: gated_delta_reg_kernel<8><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
-            case 64: gated_delta_reg_kernel<16><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
-            case 128: gated_delta_reg_kernel<32><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
-            default: gated_delta_reg_kernel<64><<<grid, 32 * kGdP>>>(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, vd, eps, head_order, ntok, snap); break;
-        }
-        return launch_result("gated_delta");
-    }
-    const int threads = vd < 32 ? 32 : ((vd + 31) / 32) * 32;
-    gated_delta_kernel<<<value_heads, threads, 2 * kd * sizeof(float)>>>(conv, b, a, ssm_a, dt, st, o, key_heads,
-                                                                         value_heads, kd, vd, eps, head_order, ntok, snap);
+    launch_gated_delta(conv, b, a, ssm_a, dt, st, o, key_heads, value_heads, kd, vd, eps, head_order, ntok, snap);
     return launch_result("gated_delta");
 }
 
@@ -1751,10 +1774,16 @@ PyObject *Runtime_copy(RuntimeObject *self, PyObject *args) {
     Py_ssize_t doff = 0, soff = 0, n = 0;
     if (!PyArg_ParseTuple(args, "snsnn", &dname, &doff, &sname, &soff, &n)) return nullptr;
     if (doff < 0 || soff < 0 || n < 0) return PyErr_Format(PyExc_ValueError, "offsets and count must be non-negative");
-    float *d = find_buffer(self, dname, static_cast<size_t>(doff + n));
-    float *s = d ? find_buffer(self, sname, static_cast<size_t>(soff + n)) : nullptr;
-    if (s == nullptr) return nullptr;
-    cudaError_t err = cudaMemcpyAsync(d + doff, s + soff, n * sizeof(float), cudaMemcpyDeviceToDevice, 0);
+    // Offsets and count in elements; both buffers must share the element size (fp32, or fp16 KV pools).
+    DeviceBuffer *db = find_any_buffer(self, dname);
+    DeviceBuffer *sb = db ? find_any_buffer(self, sname) : nullptr;
+    if (sb == nullptr) return nullptr;
+    if (db->elem != sb->elem) return PyErr_Format(PyExc_TypeError, "copy between buffers of different precision");
+    if (static_cast<size_t>(doff + n) > db->n || static_cast<size_t>(soff + n) > sb->n)
+        return PyErr_Format(PyExc_ValueError, "copy out of bounds (%s <- %s)", dname, sname);
+    const size_t e = static_cast<size_t>(db->elem);
+    cudaError_t err = cudaMemcpyAsync(reinterpret_cast<char *>(db->data) + doff * e, reinterpret_cast<char *>(sb->data) + soff * e,
+                                      n * e, cudaMemcpyDeviceToDevice, 0);
     if (err != cudaSuccess) return cuda_error("buffer copy", err);
     Py_RETURN_NONE;
 }
@@ -1872,7 +1901,247 @@ PyObject *Runtime_set_gemm_min_rows(RuntimeObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+// ---- multi-sequence passes ------------------------------------------------------------------------
+
+// set_paging(page_table_buffer, page_size, pages_per_seq, max_slots): KV caches used by the *_seg ops are
+// page pools [page][kv_head][page_size][hd]; the int32 page table holds [max_slots][pages_per_seq] page ids.
+PyObject *Runtime_set_paging(RuntimeObject *self, PyObject *args) {
+    const char *name = nullptr;
+    int page = 0, pps = 0, slots = 0;
+    if (!PyArg_ParseTuple(args, "siii", &name, &page, &pps, &slots)) return nullptr;
+    if (page < 1 || pps < 1 || slots < 1) return PyErr_Format(PyExc_ValueError, "invalid paging shape");
+    const float *pt = find_buffer(self, name, static_cast<size_t>(pps) * slots);
+    if (pt == nullptr) return nullptr;
+    self->page_table = reinterpret_cast<const int *>(pt);
+    self->page_size = page;
+    self->pages_per_seq = pps;
+    self->max_slots = slots;
+    Py_RETURN_NONE;
+}
+
+// set_segments([(slot, pos0, rows), ...]) -> total rows: row layout of the next *_seg ops (rows of a
+// segment are consecutive positions of one sequence slot; segments are stacked in order).
+PyObject *Runtime_set_segments(RuntimeObject *self, PyObject *args) {
+    PyObject *list = nullptr;
+    if (!PyArg_ParseTuple(args, "O", &list)) return nullptr;
+    if (self->page_table == nullptr) return PyErr_Format(PyExc_RuntimeError, "set_paging first");
+    PyObject *seq = PySequence_Fast(list, "segments must be a sequence");
+    if (seq == nullptr) return nullptr;
+    if (self->seg == nullptr) self->seg = new std::vector<int>();
+    self->seg->clear();
+    int row0 = 0;
+    const Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        int slot = 0, pos0 = 0, rows = 0;
+        if (!PyArg_ParseTuple(PySequence_Fast_GET_ITEM(seq, i), "iii", &slot, &pos0, &rows)) {
+            Py_DECREF(seq);
+            return nullptr;
+        }
+        if (slot < 0 || slot >= self->max_slots || pos0 < 0 || rows < 1 ||
+            pos0 + rows > self->page_size * self->pages_per_seq) {
+            Py_DECREF(seq);
+            return PyErr_Format(PyExc_ValueError, "segment (%d, %d, %d) outside the paged context", slot, pos0, rows);
+        }
+        self->seg->insert(self->seg->end(), {slot, pos0, rows, row0});
+        row0 += rows;
+    }
+    Py_DECREF(seq);
+    if (self->seg->empty()) return PyErr_Format(PyExc_ValueError, "no segments");
+    return PyLong_FromLong(row0);
+}
+
+static int seg_rows(RuntimeObject *self) {
+    const auto &g = *self->seg;
+    return g[g.size() - 2] + g[g.size() - 1];
+}
+
+static bool seg_ready(RuntimeObject *self) {
+    if (self->seg == nullptr || self->seg->empty() || self->page_table == nullptr) {
+        PyErr_SetString(PyExc_RuntimeError, "set_paging and set_segments must be called before *_seg ops");
+        return false;
+    }
+    return true;
+}
+
+static KvAddr seg_kv(RuntimeObject *self, int slot, int kv_heads) {
+    return KvAddr{self->page_table + static_cast<size_t>(slot) * self->pages_per_seq,
+                  self->page_size * self->pages_per_seq, self->page_size, kv_heads};
+}
+
+// rope_seg(x, heads, hd, rot, base): NeoX RoPE with each segment's positions.
+PyObject *Runtime_rope_seg(RuntimeObject *self, PyObject *args) {
+    const char *xname;
+    int heads = 0, hd = 0, rot = 0;
+    double base = 10000.0;
+    if (!PyArg_ParseTuple(args, "siiid", &xname, &heads, &hd, &rot, &base)) return nullptr;
+    if (!seg_ready(self)) return nullptr;
+    float *x = find_buffer(self, xname, static_cast<size_t>(heads) * hd * seg_rows(self));
+    if (x == nullptr) return nullptr;
+    const auto &g = *self->seg;
+    for (size_t i = 0; i < g.size(); i += 4) {
+        const int pos0 = g[i + 1], rows = g[i + 2], row0 = g[i + 3];
+        rope_neox_kernel<<<blocks_for(static_cast<size_t>(rows) * heads * rot / 2, 128), 128>>>(
+            x + static_cast<size_t>(row0) * heads * hd, rows, heads, hd, rot, pos0, base);
+    }
+    return launch_result("rope_seg");
+}
+
+// kv_append_seg(k, v, kc, vc, kv_heads, hd): append each segment's K/V rows to its sequence's pages.
+PyObject *Runtime_kv_append_seg(RuntimeObject *self, PyObject *args) {
+    const char *kname, *vname, *kcname, *vcname;
+    int kv_heads = 0, hd = 0;
+    if (!PyArg_ParseTuple(args, "ssssii", &kname, &vname, &kcname, &vcname, &kv_heads, &hd)) return nullptr;
+    if (!seg_ready(self)) return nullptr;
+    const size_t rowsz = static_cast<size_t>(kv_heads) * hd;
+    int ke = 0, ve = 0;
+    const float *k = find_buffer(self, kname, rowsz * seg_rows(self));
+    const float *v = k ? find_buffer(self, vname, rowsz * seg_rows(self)) : nullptr;
+    void *kc = v ? find_kv_buffer(self, kcname, rowsz, &ke) : nullptr;
+    void *vc = kc ? find_kv_buffer(self, vcname, rowsz, &ve) : nullptr;
+    if (vc == nullptr) return nullptr;
+    if (ke != ve) return PyErr_Format(PyExc_TypeError, "K and V caches differ in precision");
+    const auto &g = *self->seg;
+    for (size_t i = 0; i < g.size(); i += 4) {
+        const int slot = g[i], pos0 = g[i + 1], rows = g[i + 2], row0 = g[i + 3];
+        const size_t n = rowsz * rows;
+        const KvAddr A = seg_kv(self, slot, kv_heads);
+        if (ke == 2)
+            kv_append_kernel<__half><<<blocks_for(n, 256), 256>>>(k + row0 * rowsz, v + row0 * rowsz, static_cast<__half *>(kc),
+                                                                  static_cast<__half *>(vc), rows, kv_heads, A, hd, pos0);
+        else
+            kv_append_kernel<float><<<blocks_for(n, 256), 256>>>(k + row0 * rowsz, v + row0 * rowsz, static_cast<float *>(kc),
+                                                                 static_cast<float *>(vc), rows, kv_heads, A, hd, pos0);
+    }
+    return launch_result("kv_append_seg");
+}
+
+// attention_seg(q, kc, vc, out, heads, kv_heads, hd): causal attention of each segment over its own pages.
+PyObject *Runtime_attention_seg(RuntimeObject *self, PyObject *args) {
+    const char *qname, *kcname, *vcname, *oname;
+    int heads = 0, kv_heads = 0, hd = 0;
+    if (!PyArg_ParseTuple(args, "ssssiii", &qname, &kcname, &vcname, &oname, &heads, &kv_heads, &hd)) return nullptr;
+    if (!seg_ready(self)) return nullptr;
+    if (kv_heads <= 0 || heads % kv_heads != 0) return PyErr_Format(PyExc_ValueError, "heads must be divisible by kv_heads");
+    const size_t rowsz = static_cast<size_t>(heads) * hd;
+    int ke = 0, ve = 0;
+    const float *q = find_buffer(self, qname, rowsz * seg_rows(self));
+    const void *kc = q ? find_kv_buffer(self, kcname, 1, &ke) : nullptr;
+    const void *vc = kc ? find_kv_buffer(self, vcname, 1, &ve) : nullptr;
+    float *o = vc ? find_buffer(self, oname, rowsz * seg_rows(self)) : nullptr;
+    if (o == nullptr) return nullptr;
+    if (ke != ve) return PyErr_Format(PyExc_TypeError, "K and V caches differ in precision");
+    const auto &g = *self->seg;
+    for (size_t i = 0; i < g.size(); i += 4) {
+        const int slot = g[i], pos0 = g[i + 1], rows = g[i + 2], row0 = g[i + 3];
+        const bool prompt_pass = self->gemm_min_rows > 0 && rows >= self->gemm_min_rows;
+        const KvAddr A = seg_kv(self, slot, kv_heads);
+        PyObject *r = ke == 2
+            ? launch_attention(static_cast<const __half *>(kc), static_cast<const __half *>(vc), q + row0 * rowsz,
+                               o + row0 * rowsz, heads, kv_heads, hd, A, pos0 + 1, rows, 0, 0, prompt_pass)
+            : launch_attention(static_cast<const float *>(kc), static_cast<const float *>(vc), q + row0 * rowsz,
+                               o + row0 * rowsz, heads, kv_heads, hd, A, pos0 + 1, rows, 0, 0, prompt_pass);
+        if (r == nullptr) return nullptr;
+        Py_DECREF(r);
+    }
+    Py_RETURN_NONE;
+}
+
+// conv_update_seg(x, state, w, out, channels, K[, snap]): per-segment causal conv over the slot's state
+// ([slots][channels][K]); snapshots need a single segment.
+PyObject *Runtime_conv_update_seg(RuntimeObject *self, PyObject *args) {
+    const char *xname, *sname, *wname, *oname, *snapname = nullptr;
+    int channels = 0, K = 0;
+    if (!PyArg_ParseTuple(args, "ssssii|z", &xname, &sname, &wname, &oname, &channels, &K, &snapname)) return nullptr;
+    if (!seg_ready(self)) return nullptr;
+    const int ntok = seg_rows(self);
+    const size_t stride = static_cast<size_t>(channels) * K;
+    const float *x = find_buffer(self, xname, static_cast<size_t>(channels) * ntok);
+    float *st = x ? find_buffer(self, sname, stride * self->max_slots) : nullptr;
+    float *o = st ? find_buffer(self, oname, static_cast<size_t>(channels) * ntok) : nullptr;
+    const float *w = o ? find_f32_weight(self, wname, stride) : nullptr;
+    if (w == nullptr) return nullptr;
+    const auto &g = *self->seg;
+    float *snap = nullptr;
+    if (snapname != nullptr) {
+        if (g.size() != 4) return PyErr_Format(PyExc_ValueError, "snapshots need a single-segment pass");
+        snap = find_buffer(self, snapname, stride * (ntok - 1));
+        if (snap == nullptr) return nullptr;
+    }
+    for (size_t i = 0; i < g.size(); i += 4) {
+        const int slot = g[i], rows = g[i + 2], row0 = g[i + 3];
+        conv_update_kernel<<<blocks_for(channels, 256), 256>>>(x + static_cast<size_t>(row0) * channels, st + slot * stride, w,
+                                                               o + static_cast<size_t>(row0) * channels, channels, K, rows, snap);
+    }
+    return launch_result("conv_update_seg");
+}
+
+// gated_delta_seg(conv, beta, alpha, ssm_a, dt_bias, state, out, kh, vh, kd, vd, eps, head_order[, snap]):
+// per-segment gated delta over the slot's state ([slots][vh][kd][vd]).
+PyObject *Runtime_gated_delta_seg(RuntimeObject *self, PyObject *args) {
+    const char *cname, *bname, *aname, *ssm_a_name, *dt_name, *sname, *oname, *snapname = nullptr;
+    int key_heads = 0, value_heads = 0, kd = 0, vd = 0, head_order = 0;
+    float eps = 1e-6f;
+    if (!PyArg_ParseTuple(args, "sssssssiiiifi|z", &cname, &bname, &aname, &ssm_a_name, &dt_name, &sname, &oname,
+                          &key_heads, &value_heads, &kd, &vd, &eps, &head_order, &snapname))
+        return nullptr;
+    if (!seg_ready(self)) return nullptr;
+    if (key_heads <= 0 || value_heads % key_heads != 0) return PyErr_Format(PyExc_ValueError, "value heads must be a multiple of key heads");
+    const int ntok = seg_rows(self);
+    const size_t conv_dim = static_cast<size_t>(2) * key_heads * kd + static_cast<size_t>(value_heads) * vd;
+    const size_t state_n = static_cast<size_t>(value_heads) * kd * vd;
+    const float *conv = find_buffer(self, cname, conv_dim * ntok);
+    const float *b = conv ? find_buffer(self, bname, static_cast<size_t>(value_heads) * ntok) : nullptr;
+    const float *a = b ? find_buffer(self, aname, static_cast<size_t>(value_heads) * ntok) : nullptr;
+    float *st = a ? find_buffer(self, sname, state_n * self->max_slots) : nullptr;
+    float *o = st ? find_buffer(self, oname, static_cast<size_t>(value_heads) * vd * ntok) : nullptr;
+    const float *ssm_a = o ? find_f32_weight(self, ssm_a_name, value_heads) : nullptr;
+    const float *dt = ssm_a ? find_f32_weight(self, dt_name, value_heads) : nullptr;
+    if (dt == nullptr) return nullptr;
+    const auto &g = *self->seg;
+    float *snap = nullptr;
+    if (snapname != nullptr) {
+        if (g.size() != 4) return PyErr_Format(PyExc_ValueError, "snapshots need a single-segment pass");
+        snap = find_buffer(self, snapname, state_n * (ntok - 1));
+        if (snap == nullptr) return nullptr;
+    }
+    for (size_t i = 0; i < g.size(); i += 4) {
+        const int slot = g[i], rows = g[i + 2], row0 = g[i + 3];
+        launch_gated_delta(conv + row0 * conv_dim, b + static_cast<size_t>(row0) * value_heads,
+                           a + static_cast<size_t>(row0) * value_heads, ssm_a, dt, st + slot * state_n,
+                           o + static_cast<size_t>(row0) * value_heads * vd, key_heads, value_heads, kd, vd, eps,
+                           head_order, rows, snap);
+    }
+    return launch_result("gated_delta_seg");
+}
+
+// zero_range(name, offset, n): clear n elements from offset.
+PyObject *Runtime_zero_range(RuntimeObject *self, PyObject *args) {
+    const char *name = nullptr;
+    Py_ssize_t off = 0, n = 0;
+    if (!PyArg_ParseTuple(args, "snn", &name, &off, &n)) return nullptr;
+    DeviceBuffer *b = find_any_buffer(self, name);
+    if (b == nullptr) return nullptr;
+    if (off < 0 || n < 0 || static_cast<size_t>(off + n) > b->n) return PyErr_Format(PyExc_ValueError, "zero_range out of bounds");
+    cudaError_t err = cudaMemset(reinterpret_cast<char *>(b->data) + static_cast<size_t>(off) * b->elem, 0,
+                                 static_cast<size_t>(n) * b->elem);
+    if (err != cudaSuccess) return cuda_error("cudaMemset", err);
+    Py_RETURN_NONE;
+}
+
 PyMethodDef Runtime_methods[] = {
+    {"set_paging", reinterpret_cast<PyCFunction>(Runtime_set_paging), METH_VARARGS,
+     "set_paging(page_table, page_size, pages_per_seq, max_slots): paged KV pools for the *_seg ops."},
+    {"set_segments", reinterpret_cast<PyCFunction>(Runtime_set_segments), METH_VARARGS,
+     "set_segments([(slot, pos0, rows), ...]) -> total rows: row layout of the next *_seg ops."},
+    {"rope_seg", reinterpret_cast<PyCFunction>(Runtime_rope_seg), METH_VARARGS, "rope_seg(x, heads, hd, rot, base)."},
+    {"kv_append_seg", reinterpret_cast<PyCFunction>(Runtime_kv_append_seg), METH_VARARGS, "kv_append_seg(k, v, kc, vc, kv_heads, hd)."},
+    {"attention_seg", reinterpret_cast<PyCFunction>(Runtime_attention_seg), METH_VARARGS,
+     "attention_seg(q, kc, vc, out, heads, kv_heads, hd): causal paged attention per segment."},
+    {"conv_update_seg", reinterpret_cast<PyCFunction>(Runtime_conv_update_seg), METH_VARARGS,
+     "conv_update_seg(x, state, w, out, channels, K[, snap])."},
+    {"gated_delta_seg", reinterpret_cast<PyCFunction>(Runtime_gated_delta_seg), METH_VARARGS,
+     "gated_delta_seg(conv, beta, alpha, ssm_a, dt_bias, state, out, kh, vh, kd, vd, eps, head_order[, snap])."},
+    {"zero_range", reinterpret_cast<PyCFunction>(Runtime_zero_range), METH_VARARGS, "zero_range(name, offset, n)."},
     {"buffer_elem", reinterpret_cast<PyCFunction>(Runtime_buffer_elem), METH_VARARGS,
      "buffer_elem(name) -> bytes per element (4 = fp32, 2 = fp16)."},
     {"set_gemm_min_rows", reinterpret_cast<PyCFunction>(Runtime_set_gemm_min_rows), METH_VARARGS,

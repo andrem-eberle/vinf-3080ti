@@ -66,9 +66,38 @@ class MtpDrafter:
         self.max_draft = executor.max_batch - 1
         self.pending_tokens: list[int] = []
         self.pending_pos = 0
+        # Per-sequence state: pending rows live at spec_pend rows [slot * max_batch, ...).
+        self._states: dict[int, tuple[list[int], int]] = {}
+        self._bound = None
+        self.row_base = 0
 
     def reset(self) -> None:
         self.pending_tokens, self.pending_pos = [], 0
+
+    def bind(self, seq) -> None:
+        """Switch the drafter to sequence seq (its pending rows and state)."""
+        if self._bound is not None:
+            self._states[id(self._bound)] = (self.pending_tokens, self.pending_pos)
+        self._bound = seq
+        self.row_base = seq.slot * self.ex.max_batch
+        self.pending_tokens, self.pending_pos = self._states.pop(id(seq), ([], 0))
+
+    def forget(self, seq) -> None:
+        self._states.pop(id(seq), None)
+        if self._bound is seq:
+            self._bound = None
+            self.pending_tokens, self.pending_pos = [], 0
+
+    def bootstrap(self, src: str, row: int, position: int) -> None:
+        """Start drafting for the bound sequence from post-norm hidden row `row` of src (its last forwarded
+        position, position - 1) after passes the drafter did not observe (e.g. multi-sequence decode)."""
+        h = self.ex.shapes.hidden
+        self.ex.rt.copy("spec_pend", self.row_base * h, src, row * h, h)
+        self.pending_tokens, self.pending_pos = [-1], position - 1
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.pending_tokens)
 
     def _hidden_source(self) -> str:
         return self.ex.post_norm_rows() if self.target_hidden == "post" else "h"
@@ -78,7 +107,7 @@ class MtpDrafter:
         src = self._hidden_source()
         last = start + len(chunk) == len(prompt)
         if last:  # keep the final prompt row; its MTP row needs the first generated token
-            ex.rt.copy("spec_pend", 0, src, (len(chunk) - 1) * h, h)
+            ex.rt.copy("spec_pend", self.row_base * h, src, (len(chunk) - 1) * h, h)
             self.pending_tokens, self.pending_pos = [-1], start + len(chunk) - 1
         known = len(chunk) - (1 if last else 0)
         if known:
@@ -89,7 +118,7 @@ class MtpDrafter:
         ex = self.ex
         tokens = list(self.pending_tokens)
         tokens[-1] = last_token
-        ex.mtp_load_hidden("spec_pend", 0, len(tokens))
+        ex.mtp_load_hidden("spec_pend", self.row_base, len(tokens))
         drafts = [ex.mtp_forward(tokens, self.pending_pos)]
         last_row = len(tokens) - 1
         pos = self.pending_pos + len(tokens)
@@ -104,7 +133,7 @@ class MtpDrafter:
     def observe_verify(self, position: int, keep: int, emitted: list[int]) -> None:
         h = self.ex.shapes.hidden
         src = "xn" if self.target_hidden == "post" else "h"  # greedy_rows() left post-norm rows in "xn"
-        self.ex.rt.copy("spec_pend", 0, src, 0, keep * h)
+        self.ex.rt.copy("spec_pend", self.row_base * h, src, 0, keep * h)
         self.pending_tokens, self.pending_pos = list(emitted), position
 
 
@@ -137,9 +166,38 @@ class QwenSpeculativeDecoder:
         start = prefix_cache.begin(prompt) if prefix_cache is not None else 0
         if prefix_cache is None:
             ex.reset()
-        ex.prefill(prompt, start=start, before_last=prefix_cache.checkpoint if prefix_cache is not None else None,
+        self._bind()
+        ex.prefill(prompt, start=start,
+                   before_last=(lambda: prefix_cache.checkpoint(prompt)) if prefix_cache is not None else None,
                    observe=lambda i, chunk: self.drafter.observe_prefill(i, chunk, prompt))
         return ex.greedy_next(), start
+
+    def _bind(self) -> None:
+        bind = getattr(self.drafter, "bind", None)
+        if bind is not None:
+            bind(self.ex.seq)
+
+    def step(self, last_token: int, max_tokens: int) -> list[int]:
+        """One draft + verify step for the active sequence (last_token is its next input, not yet
+        forwarded); returns the emitted tokens (1..k+1, at most max_tokens)."""
+        ex = self.ex
+        position = ex.position
+        k = min(self.k, ex.max_context - position - 1, max_tokens - 1)
+        if k < 1:
+            ex.forward_tokens([last_token])
+            return [ex.greedy_next()]
+        drafts = self.drafter.draft(last_token, position, k)
+        ex.forward_tokens([last_token] + drafts, snapshot=True)
+        targets = ex.greedy_rows()
+        accepted = 0
+        while accepted < k and drafts[accepted] == targets[accepted]:
+            accepted += 1
+        keep = accepted + 1
+        emitted = targets[:keep]
+        self.drafter.observe_verify(position, keep, emitted)
+        ex.rollback(keep)
+        self.last_accepted, self.last_drafted = accepted, k
+        return emitted
 
     def generate(
         self,

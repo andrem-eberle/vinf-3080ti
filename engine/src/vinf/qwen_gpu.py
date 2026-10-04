@@ -65,6 +65,27 @@ HEAD_ORDERS = {"grouped": 0, "tiled": 1}
 MAX_BATCH = 8
 
 
+class KvPoolExhausted(InsufficientMemoryError):
+    """No free KV pages (or sequence slots) for the requested context."""
+
+
+@dataclass(eq=False)
+class Sequence:
+    """One decoding sequence: a state slot (SSM/conv state, drafter rows) and its KV pages.
+
+    tokens are the ids at positions [0, position) whose KV/state are live."""
+
+    slot: int
+    pages: list[int] = field(default_factory=list)
+    tokens: list[int] = field(default_factory=list)
+    busy: bool = False  # owned by a running request (idle sequences may be reused or evicted)
+    last_used: int = 0
+
+    @property
+    def position(self) -> int:
+        return len(self.tokens)
+
+
 def qwen_qmv_order(schedule: tuple[QwenLayerKind, ...]) -> tuple[str, ...]:
     names: list[str] = []
     for layer_idx, kind in enumerate(schedule):
@@ -133,6 +154,7 @@ class ProfilingRuntime:
     TIMED = frozenset({
         "qmv", "rmsnorm", "gated_rmsnorm", "add", "silu_mul", "sigmoid_mul", "split_gated_q",
         "rope", "kv_append", "attention", "conv_update", "gated_delta", "argmax", "write",
+        "rope_seg", "kv_append_seg", "attention_seg", "conv_update_seg", "gated_delta_seg",
     })
 
     def __init__(self, runtime, streamed_names: frozenset[str]) -> None:
@@ -185,6 +207,9 @@ class QwenGpuExecutor:
         max_batch: int = 8,
         prefill_batch: int = 256,
         kv_dtype: str = "f16",
+        max_seqs: int = 1,
+        kv_pool_tokens: int | None = None,
+        page_size: int = 256,
         snapshot_tokens: int = 0,
         mtp: bool = False,
         placement: str = "hybrid",
@@ -198,6 +223,8 @@ class QwenGpuExecutor:
             raise ConfigurationError("placement must be 'hybrid' (CPU computes layers that do not fit) or 'stream'")
         if not 1 <= max_batch <= MAX_BATCH:
             raise ConfigurationError(f"max_batch must be in [1, {MAX_BATCH}]")
+        if not 1 <= max_seqs <= MAX_BATCH:
+            raise ConfigurationError(f"max_seqs must be in [1, {MAX_BATCH}]")
         if kv_dtype not in ("f16", "f32"):
             raise ConfigurationError("kv_dtype must be 'f16' or 'f32'")
         if prefill_batch < 1:
@@ -226,6 +253,15 @@ class QwenGpuExecutor:
         self.max_batch = max_batch
         # GPU attention KV caches in fp16 halve their VRAM (attention math stays fp32); CPU layers keep fp32.
         self.kv_dtype = kv_dtype
+        # Sequences: max_seqs state slots; attention KV lives in a shared pool of pages ([page][kv_head]
+        # [page_size][head_dim]) handed out per sequence, so concurrent sequences share the pool. CPU layers
+        # (hybrid) and the megakernel use one page spanning the whole context (= the contiguous layout).
+        self.max_seqs = max_seqs
+        self.page_size = max(1, min(page_size, max_context))
+        self.pages_per_seq = -(-max_context // self.page_size)
+        pool = max_context if kv_pool_tokens is None else max(kv_pool_tokens, self.page_size)
+        self.kv_pages = -(-pool // self.page_size)
+        self.reclaim = None  # optional callback(pages_needed) -> bool that frees idle sequences
         # Rows per prompt-processing pass: each streamed weight crosses PCIe once per pass, so wide passes
         # make prefill compute-bound instead of PCIe-bound. DFlash feature capture keeps max_batch rows.
         self.prefill_batch = max(max_batch, prefill_batch) if not capture_layers else max_batch
@@ -258,13 +294,22 @@ class QwenGpuExecutor:
             self.cpu_layers = frozenset(range(first, len(self.schedule)))
             self.plan = self._plan(free_vram_bytes, safety_bytes)
         if self.cpu_layers:
+            # CPU layers hold one sequence in contiguous caches: one KV page spanning the context.
+            if self.max_seqs > 1:
+                raise ConfigurationError("the model does not fit the GPU with hybrid placement and several "
+                                         "sequences; CPU layers run a single sequence (use --max-seqs 1)")
+            if self.page_size != max_context:
+                self.page_size, self.pages_per_seq, self.kv_pages = max_context, 1, 1
+                self.plan = self._plan(free_vram_bytes, safety_bytes)
             from vinf.cpu_qwen import CpuQwenRuntime
 
             self.cpu = CpuQwenRuntime(cpu_threads)
         self._load_weights(progress)
         self._alloc_buffers()
-        self.position = 0
-        self.tokens: list[int] = []  # token ids at positions [0, position) whose KV/state is live
+        self.free_slots = list(range(self.max_seqs))
+        self.free_pages = list(range(self.kv_pages))
+        self.sequences: list[Sequence] = []
+        self.seq = self.new_sequence()  # the active sequence of the single-sequence API
 
     @classmethod
     def plan_only(cls, gguf: GGUFFile, metadata: ModelMetadata, *, max_context: int = 2048,
@@ -276,6 +321,8 @@ class QwenGpuExecutor:
         self.max_batch, self.snapshot_tokens, self.last_ntok = 8, 0, 0
         self.prefill_batch = 256
         self.kv_dtype = "f16"
+        self.max_seqs, self.page_size, self.pages_per_seq = 1, max_context, 1
+        self.kv_pages = 1
         self.mtp_layer = None
         self.placement, self.cpu_layers, self.cpu = "stream", frozenset(), None
         self.capture_layers, self.reserve_extra_bytes = (), 0
@@ -292,7 +339,7 @@ class QwenGpuExecutor:
         self.placement = "hybrid"
         self.cpu_layers = self._choose_cpu_layers(free_vram_bytes, safety_bytes)
         self.plan = self._plan(free_vram_bytes, safety_bytes)
-        self.position = 0
+        self.seq = None
         return self
 
     def report(self) -> str:
@@ -367,7 +414,10 @@ class QwenGpuExecutor:
         if self.capture_layers:
             specs["cap_feat"] = len(self.capture_layers) * s.hidden
         specs = {name: n * self.prefill_batch for name, n in specs.items()}
-        specs["logits"] = s.vocab * self.max_batch  # LM head rows: verification passes only
+        specs["logits"] = s.vocab * self.max_batch  # LM head rows: verification / multi-sequence passes only
+        if "spec_pend" in specs:  # MTP rows pending per sequence slot
+            specs["spec_pend"] = s.hidden * self.max_batch * self.max_seqs
+        specs["page_table"] = self.max_seqs * self.pages_per_seq
         specs["h_last"] = s.hidden
         return specs
 
@@ -376,21 +426,21 @@ class QwenGpuExecutor:
         specs: dict[str, int] = {}
         for layer_idx, kind in enumerate(self.schedule):
             if kind is QwenLayerKind.FULL_ATTENTION:
-                cache = s.kv_heads * self.max_context * s.head_dim
+                cache = self.kv_pages * s.kv_heads * self.page_size * s.head_dim
                 specs[f"kc.{layer_idx}"] = cache
                 specs[f"vc.{layer_idx}"] = cache
             else:
                 conv = s.conv_dim * s.conv_kernel
                 ssm = s.value_heads * s.key_head_dim * s.value_head_dim
-                specs[f"conv.{layer_idx}"] = conv
-                specs[f"ssm.{layer_idx}"] = ssm
+                specs[f"conv.{layer_idx}"] = conv * self.max_seqs
+                specs[f"ssm.{layer_idx}"] = ssm * self.max_seqs
                 if self.snapshot_tokens > 1:
                     # States after tokens 0..n-2 of a multi-token pass (the last token's state is live),
                     # for rollback to any accepted position.
                     specs[f"conv_snap.{layer_idx}"] = conv * (self.snapshot_tokens - 1)
                     specs[f"ssm_snap.{layer_idx}"] = ssm * (self.snapshot_tokens - 1)
         if self.mtp_layer is not None:
-            cache = s.kv_heads * self.max_context * s.head_dim
+            cache = self.kv_pages * s.kv_heads * self.page_size * s.head_dim
             specs[f"kc.{self.mtp_layer}"] = cache
             specs[f"vc.{self.mtp_layer}"] = cache
         return specs
@@ -502,6 +552,83 @@ class QwenGpuExecutor:
         if self.cpu is not None:
             for name, n in {**self._buffer_specs(), **self._cpu_state_specs()}.items():
                 self.cpu.alloc(name, n)
+        self.rt.set_paging("page_table", self.page_size, self.pages_per_seq, self.max_seqs)
+
+    # ---- sequences ------------------------------------------------------------------------------
+
+    @property
+    def position(self) -> int:
+        return self.seq.position if self.seq is not None else 0
+
+    @property
+    def tokens(self) -> list[int]:
+        return self.seq.tokens
+
+    def new_sequence(self) -> Sequence:
+        """A fresh sequence in a free slot (state zeroed, no pages yet)."""
+        if not self.free_slots:
+            raise KvPoolExhausted(f"all {self.max_seqs} sequence slots are in use")
+        seq = Sequence(self.free_slots.pop(0))
+        self.sequences.append(seq)
+        self._zero_slot(seq.slot)
+        return seq
+
+    def release_sequence(self, seq: Sequence) -> None:
+        """Free a sequence's slot and KV pages."""
+        if seq not in self.sequences:
+            return
+        self.sequences.remove(seq)
+        self.free_pages.extend(seq.pages)
+        seq.pages, seq.tokens = [], []
+        self.free_slots.append(seq.slot)
+        if self.seq is seq:
+            self.seq = None
+
+    def activate(self, seq: Sequence) -> None:
+        """Make seq the target of the single-sequence API (forward_tokens, prefill, rollback, ...)."""
+        self.seq = seq
+
+    def ensure_pages(self, seq: Sequence, length: int) -> None:
+        """Give seq enough KV pages for positions [0, length)."""
+        if length > self.max_context:
+            raise ConfigurationError(f"context is full (max_context={self.max_context})")
+        need = -(-length // self.page_size) - len(seq.pages)
+        if need <= 0:
+            return
+        while len(self.free_pages) < need:
+            if self.reclaim is None or not self.reclaim(need - len(self.free_pages)):
+                raise KvPoolExhausted(
+                    f"KV pool exhausted: need {need} more pages of {self.page_size} tokens, "
+                    f"{len(self.free_pages)} free of {self.kv_pages}")
+        seq.pages.extend(self.free_pages[:need])
+        del self.free_pages[:need]
+        self.rt.write("page_table", array("i", seq.pages).tobytes(), seq.slot * self.pages_per_seq)
+
+    def copy_kv(self, src: Sequence, dst: Sequence, length: int) -> None:
+        """Copy the attention KV rows [0, length) of src into dst's pages (device to device)."""
+        if self.cpu_layers:
+            raise ConfigurationError("KV copies between sequences need every attention layer on the GPU")
+        self.ensure_pages(dst, length)
+        s = self.shapes
+        page_elems = s.kv_heads * self.page_size * s.head_dim
+        for layer in self._kv_layers():
+            for kind in ("kc", "vc"):
+                name = f"{kind}.{layer}"
+                for i in range(-(-length // self.page_size)):
+                    self.rt.copy(name, dst.pages[i] * page_elems, name, src.pages[i] * page_elems, page_elems)
+
+    def free_page_count(self) -> int:
+        return len(self.free_pages)
+
+    def _zero_slot(self, slot: int) -> None:
+        specs = self._state_specs()
+        for name in self._recurrent_names():
+            layer = self._layer_of(name)
+            if layer in self.cpu_layers:
+                self.cpu.zero(name)
+            else:
+                per = specs[name] // self.max_seqs
+                self.rt.zero_range(name, slot * per, per)
 
     # ---- decode ------------------------------------------------------------------------
 
@@ -527,13 +654,15 @@ class QwenGpuExecutor:
         return self.cpu if layer_idx in self.cpu_layers else self.rt
 
     def reset(self) -> None:
-        for name in self._gpu_state_specs():
-            self.rt.zero(name)
+        """Restart the active sequence at position 0 (keeps its slot and pages)."""
+        if self.seq is None:
+            self.seq = self.new_sequence()
+        self._zero_slot(self.seq.slot)
         if self.cpu is not None:
             for name in self._cpu_state_specs():
                 self.cpu.zero(name)
-        self.position = 0
-        self.tokens = []
+        self.seq.tokens = []
+        self.last_ntok = 0
 
     def _full_attention(self, layer_idx: int, position: int, n: int = 1, h: str = "h") -> None:
         rt, s, p = self._rt(layer_idx), self.shapes, f"blk.{layer_idx}."
@@ -544,11 +673,17 @@ class QwenGpuExecutor:
         rt.split_gated_q("q_raw", "q", "q_gate", s.heads * n, s.head_dim)
         rt.rmsnorm("q", p + "attn_q_norm.weight", "q", s.head_dim, s.eps, s.heads * n)
         rt.rmsnorm("k", p + "attn_k_norm.weight", "k", s.head_dim, s.eps, s.kv_heads * n)
-        rt.rope("q", s.heads, s.head_dim, s.rotary_dim, position, s.freq_base, n)
-        rt.rope("k", s.kv_heads, s.head_dim, s.rotary_dim, position, s.freq_base, n)
         kc, vc = f"kc.{layer_idx}", f"vc.{layer_idx}"
-        rt.kv_append("k", "v", kc, vc, s.kv_heads, self.max_context, s.head_dim, position, n)
-        rt.attention("q", kc, vc, "attn", s.heads, s.kv_heads, s.head_dim, self.max_context, position + 1, n)
+        if rt is self.rt:  # paged KV, rows laid out by the current segments (set_segments)
+            rt.rope_seg("q", s.heads, s.head_dim, s.rotary_dim, s.freq_base)
+            rt.rope_seg("k", s.kv_heads, s.head_dim, s.rotary_dim, s.freq_base)
+            rt.kv_append_seg("k", "v", kc, vc, s.kv_heads, s.head_dim)
+            rt.attention_seg("q", kc, vc, "attn", s.heads, s.kv_heads, s.head_dim)
+        else:  # CPU layers: single sequence, contiguous cache
+            rt.rope("q", s.heads, s.head_dim, s.rotary_dim, position, s.freq_base, n)
+            rt.rope("k", s.kv_heads, s.head_dim, s.rotary_dim, position, s.freq_base, n)
+            rt.kv_append("k", "v", kc, vc, s.kv_heads, self.max_context, s.head_dim, position, n)
+            rt.attention("q", kc, vc, "attn", s.heads, s.kv_heads, s.head_dim, self.max_context, position + 1, n)
         rt.sigmoid_mul("attn", "q_gate", "attn", s.heads * s.head_dim * n)
         rt.qmv(p + "attn_output.weight", "attn", "proj", n)
         rt.add(h, "proj", h, s.hidden * n)
@@ -560,27 +695,18 @@ class QwenGpuExecutor:
         rt.qmv(p + "attn_gate.weight", "xn", "lin_z", n)
         rt.qmv(p + "ssm_beta.weight", "xn", "lin_beta", n)
         rt.qmv(p + "ssm_alpha.weight", "xn", "lin_alpha", n)
-        rt.conv_update(
-            "lin_qkv", f"conv.{layer_idx}", p + "ssm_conv1d.weight", "lin_conv", s.conv_dim, s.conv_kernel,
-            n, f"conv_snap.{layer_idx}" if snapshot else None,
-        )
-        rt.gated_delta(
-            "lin_conv",
-            "lin_beta",
-            "lin_alpha",
-            p + "ssm_a",
-            p + "ssm_dt.bias",
-            f"ssm.{layer_idx}",
-            "lin_core",
-            s.key_heads,
-            s.value_heads,
-            s.key_head_dim,
-            s.value_head_dim,
-            s.eps,
-            self.head_order,
-            n,
-            f"ssm_snap.{layer_idx}" if snapshot else None,
-        )
+        conv_snap = f"conv_snap.{layer_idx}" if snapshot else None
+        ssm_snap = f"ssm_snap.{layer_idx}" if snapshot else None
+        gd = ("lin_conv", "lin_beta", "lin_alpha", p + "ssm_a", p + "ssm_dt.bias", f"ssm.{layer_idx}", "lin_core",
+              s.key_heads, s.value_heads, s.key_head_dim, s.value_head_dim, s.eps, self.head_order)
+        if rt is self.rt:  # state slot per segment
+            rt.conv_update_seg("lin_qkv", f"conv.{layer_idx}", p + "ssm_conv1d.weight", "lin_conv", s.conv_dim,
+                               s.conv_kernel, conv_snap)
+            rt.gated_delta_seg(*gd, ssm_snap)
+        else:
+            rt.conv_update("lin_qkv", f"conv.{layer_idx}", p + "ssm_conv1d.weight", "lin_conv", s.conv_dim,
+                           s.conv_kernel, n, conv_snap)
+            rt.gated_delta(*gd, n, ssm_snap)
         rt.gated_rmsnorm("lin_core", p + "ssm_norm.weight", "lin_z", "lin_out", s.value_head_dim, s.eps, s.value_heads * n)
         rt.qmv(p + "ssm_out.weight", "lin_out", "proj", n)
         rt.add("h", "proj", "h", s.hidden * n)
@@ -605,7 +731,34 @@ class QwenGpuExecutor:
             raise ConfigurationError(f"context is full (max_context={self.max_context})")
         if snapshot and n > self.snapshot_tokens:
             raise ConfigurationError(f"snapshot needs snapshot_tokens >= {n} (have {self.snapshot_tokens})")
-        rows = load_qwen_token_embeddings(self.gguf, list(token_ids))
+        seq = self.seq
+        self.ensure_pages(seq, seq.position + n)
+        self.rt.set_segments([(seq.slot, seq.position, n)])
+        self._forward_rows(list(token_ids), self.position, snapshot)
+        seq.tokens.extend(token_ids)
+        self.last_ntok = n
+
+    def forward_multi(self, seqs: list[Sequence], token_ids: list[int]) -> None:
+        """One pass over one new token for each sequence (reading every weight once for all of them).
+        Row r of the pass belongs to seqs[r]; follow with greedy_rows() for each sequence's next token."""
+        n = len(seqs)
+        if not 1 <= n <= self.max_batch or len(token_ids) != n:
+            raise ConfigurationError(f"multi-sequence pass needs 1..{self.max_batch} sequences, one token each")
+        if self.cpu_layers and n > 1:
+            raise ConfigurationError("CPU layers run a single sequence")
+        for seq in seqs:
+            self.ensure_pages(seq, seq.position + 1)
+        self.rt.set_segments([(seq.slot, seq.position, 1) for seq in seqs])
+        self._forward_rows(list(token_ids), seqs[0].position, False)
+        for seq, token in zip(seqs, token_ids):
+            seq.tokens.append(token)
+        self.last_ntok = n
+
+    def _forward_rows(self, token_ids: list[int], position: int, snapshot: bool) -> None:
+        """Run the rows laid out by the current segments through every decoder layer (position is used
+        by CPU layers, which hold a single sequence)."""
+        n = len(token_ids)
+        rows = load_qwen_token_embeddings(self.gguf, token_ids)
         hn = n * self.shapes.hidden
         here = self._rt(0)
         here.write("h", array("f", [value for row in rows for value in row]).tobytes())
@@ -615,7 +768,7 @@ class QwenGpuExecutor:
                 there.write("h", here.read("h", hn))
                 here = there
             if kind is QwenLayerKind.FULL_ATTENTION:
-                self._full_attention(layer_idx, self.position, n)
+                self._full_attention(layer_idx, position, n)
             else:
                 self._linear_attention(layer_idx, n, snapshot)
             self._mlp(layer_idx, n)
@@ -623,9 +776,6 @@ class QwenGpuExecutor:
                 self._capture(layer_idx, here, n)
         if here is not self.rt:  # LM head / MTP live on the GPU
             self.rt.write("h", here.read("h", hn))
-        self.position += n
-        self.tokens.extend(token_ids)
-        self.last_ntok = n
 
     def _capture(self, layer_idx: int, rt, n: int) -> None:
         """Copy this layer's output rows into "cap_feat" at the layer's column slot."""
@@ -653,13 +803,14 @@ class QwenGpuExecutor:
         s = self.shapes
         conv = s.conv_dim * s.conv_kernel
         ssm = s.value_heads * s.key_head_dim * s.value_head_dim
+        slot = self.seq.slot
         for layer_idx, kind in enumerate(self.schedule):
             if kind is QwenLayerKind.LINEAR_ATTENTION:
                 rt = self._rt(layer_idx)
-                rt.copy(f"conv.{layer_idx}", 0, f"conv_snap.{layer_idx}", (keep - 1) * conv, conv)
-                rt.copy(f"ssm.{layer_idx}", 0, f"ssm_snap.{layer_idx}", (keep - 1) * ssm, ssm)
-        self.position -= n - keep
-        del self.tokens[self.position:]
+                k = slot if rt is self.rt else 0
+                rt.copy(f"conv.{layer_idx}", k * conv, f"conv_snap.{layer_idx}", (keep - 1) * conv, conv)
+                rt.copy(f"ssm.{layer_idx}", k * ssm, f"ssm_snap.{layer_idx}", (keep - 1) * ssm, ssm)
+        del self.seq.tokens[len(self.seq.tokens) - (n - keep):]
         self.last_ntok = keep
 
     def _lm_head(self) -> None:
@@ -717,6 +868,8 @@ class QwenGpuExecutor:
             raise ConfigurationError("invalid MTP batch or position")
         rt, s, p = self.rt, self.shapes, f"blk.{self.mtp_layer}."
         h = s.hidden
+        self.ensure_pages(self.seq, position + n)
+        rt.set_segments([(self.seq.slot, position, n)])
         rows = load_qwen_token_embeddings(self.gguf, list(next_tokens))
         rt.write("mtp_e", array("f", [v for row in rows for v in row]).tobytes())
         e_half = 0 if self.mtp_concat == "eh" else 1
@@ -772,46 +925,61 @@ class QwenGpuExecutor:
                    for layer in self._kv_layers())
 
     def recurrent_bytes(self) -> int:
-        specs = self._state_specs()
-        return sum(specs[n] for n in self._recurrent_names()) * 4
+        specs = self._state_specs()  # per sequence (the specs cover every slot)
+        return sum(specs[n] // self.max_seqs for n in self._recurrent_names()) * 4
 
     def save_recurrent(self) -> dict[str, bytes]:
-        """Host copy of the SSM/conv state (the part of the sequence state that cannot be rewound)."""
-        out = {}
+        """Host copy of the active sequence's SSM/conv state (the part that cannot be rewound)."""
+        specs, out = self._state_specs(), {}
         for name in self._recurrent_names():
-            out[name] = self._rt(self._layer_of(name)).read(name)
+            rt = self._rt(self._layer_of(name))
+            per = specs[name] // self.max_seqs
+            out[name] = rt.read(name, per, (self.seq.slot if rt is self.rt else 0) * per)
         return out
 
     def load_recurrent(self, state: dict[str, bytes]) -> None:
+        specs = self._state_specs()
         for name, data in state.items():
-            self._rt(self._layer_of(name)).write(name, data)
+            rt = self._rt(self._layer_of(name))
+            per = specs[name] // self.max_seqs
+            rt.write(name, data, (self.seq.slot if rt is self.rt else 0) * per)
 
     def save_kv(self, length: int) -> dict[str, list[bytes]]:
-        """Host copy of the attention KV rows [0, length) (cache layout [kv_head][max_context][head_dim])."""
+        """Host copy of the active sequence's attention KV rows [0, length): the pages covering them
+        (GPU pools) or per-head row ranges (contiguous CPU caches)."""
         s, out = self.shapes, {}
+        page_elems = s.kv_heads * self.page_size * s.head_dim
+        npages = -(-length // self.page_size)
         for layer in self._kv_layers():
             rt = self._rt(layer)
             for kind in ("kc", "vc"):
                 name = f"{kind}.{layer}"
-                out[name] = [rt.read(name, length * s.head_dim, h * self.max_context * s.head_dim)
-                             for h in range(s.kv_heads)]
+                if rt is self.rt:
+                    out[name] = [rt.read(name, page_elems, pg * page_elems) for pg in self.seq.pages[:npages]]
+                else:
+                    out[name] = [rt.read(name, length * s.head_dim, h * self.max_context * s.head_dim)
+                                 for h in range(s.kv_heads)]
         return out
 
-    def load_kv(self, kv: dict[str, list[bytes]]) -> None:
+    def load_kv(self, kv: dict[str, list[bytes]], length: int) -> None:
         s = self.shapes
-        for name, heads in kv.items():
+        page_elems = s.kv_heads * self.page_size * s.head_dim
+        self.ensure_pages(self.seq, length)
+        for name, parts in kv.items():
             rt = self._rt(self._layer_of(name))
-            for h, data in enumerate(heads):
-                rt.write(name, data, h * self.max_context * s.head_dim)
+            for i, data in enumerate(parts):
+                if rt is self.rt:
+                    rt.write(name, data, self.seq.pages[i] * page_elems)
+                else:
+                    rt.write(name, data, i * self.max_context * s.head_dim)
 
     def resume(self, tokens: list[int], recurrent: dict[str, bytes], kv: dict[str, list[bytes]] | None) -> None:
-        """Make `tokens` the live sequence: recurrent state from a checkpoint, KV rows from the host copy
-        (or already on the device when kv is None)."""
+        """Make `tokens` the active sequence's live state: recurrent state from a checkpoint, KV rows
+        from the host copy (or already in the sequence's pages when kv is None)."""
         self.load_recurrent(recurrent)
         if kv is not None:
-            self.load_kv(kv)
-        self.tokens = list(tokens)
-        self.position = len(tokens)
+            self.load_kv(kv, len(tokens))
+        self.seq.tokens = list(tokens)
         self.last_ntok = 0
 
     def generate_greedy(
@@ -836,7 +1004,7 @@ class QwenGpuExecutor:
         if prefix_cache is None:
             self.reset()
         self.prefill(prompt_tokens, start=start,
-                     before_last=prefix_cache.checkpoint if prefix_cache is not None else None)
+                     before_last=(lambda: prefix_cache.checkpoint(prompt_tokens)) if prefix_cache is not None else None)
         stats.cached_tokens = start
         token = self.greedy_next()
         stats.prefill_seconds = time.perf_counter() - t0

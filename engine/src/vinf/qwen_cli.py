@@ -38,6 +38,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="prompt tokens per pass; each streamed weight crosses PCIe once per pass")
     parser.add_argument("--kv-dtype", choices=("f16", "f32"), default="f16",
                         help="attention KV cache precision (f16 halves its VRAM; the megakernel uses f32)")
+    parser.add_argument("--max-seqs", type=int, default=None,
+                        help="concurrent sequences (default 4 with --serve, else 1); they share the KV pool")
+    parser.add_argument("--kv-pool-tokens", type=int, default=None,
+                        help="KV cache tokens shared by all sequences (default: --max-context)")
     parser.add_argument("--prefix-cache-mib", type=int, default=8192,
                         help="host memory for prompt prefix checkpoints (0 disables); reuses earlier turns of a conversation")
     parser.add_argument("--report-only", action="store_true", help="print memory/residency plan and exit")
